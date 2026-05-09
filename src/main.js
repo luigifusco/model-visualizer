@@ -6,11 +6,26 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 
+const pictureResolutionLevels = [
+  { width: 160, height: 113 },
+  { width: 240, height: 169 },
+  { width: 320, height: 225 },
+  { width: 480, height: 338 },
+  { width: 640, height: 450 },
+  { width: 800, height: 563 },
+  { width: 960, height: 675 },
+  { width: 1120, height: 788 },
+  { width: 1280, height: 900 },
+];
+const pictureTargetDelayMs = 500;
+
 const app = document.querySelector('#app');
 const basePath = getBasePath();
 const route = getRoute();
 
-if (route.startsWith('/models/')) {
+if (route.startsWith('/snapshot/')) {
+  renderSnapshot(route.split('/')[2]);
+} else if (route.startsWith('/models/')) {
   renderViewer(route.split('/')[2]);
 } else {
   renderUploader();
@@ -108,7 +123,10 @@ function renderUploader() {
           <input id="share-url" value="${escapeAttribute(payload.url)}" readonly />
           <button id="copy-button" type="button">Copy</button>
         </div>
-        <a class="viewer-link" href="${escapeAttribute(toLocalUrl(payload.url))}">Open viewer</a>
+        <div class="viewer-links">
+          <a class="viewer-link" href="${escapeAttribute(toLocalUrl(payload.url))}">Open 3D viewer</a>
+          <a class="viewer-link" href="${escapeAttribute(`${toLocalUrl(payload.url)}/picture`)}">Open picture mode</a>
+        </div>
       `;
       result.hidden = false;
 
@@ -203,6 +221,12 @@ function createUploadError(message, debug) {
 }
 
 function renderViewer(modelId) {
+  const isPictureMode = route === `/models/${modelId}/picture`;
+  if (isPictureMode) {
+    renderPictureViewer(modelId);
+    return;
+  }
+
   app.innerHTML = `
     <main class="viewer-page">
       <header class="viewer-header">
@@ -210,6 +234,10 @@ function renderViewer(modelId) {
         <div>
           <p class="eyebrow">3D viewer</p>
           <h1>Shared OBJ model</h1>
+          <nav class="viewer-mode-links" aria-label="Viewer modes">
+            <a aria-current="page" href="${basePath}/models/${modelId}">3D</a>
+            <a href="${basePath}/models/${modelId}/picture">Picture</a>
+          </nav>
         </div>
       </header>
       <section class="viewer-shell">
@@ -228,7 +256,176 @@ function renderViewer(modelId) {
   loadModel(modelId);
 }
 
-async function loadModel(modelId) {
+function renderPictureViewer(modelId) {
+  app.innerHTML = `
+    <main class="viewer-page picture-page">
+      <header class="viewer-header">
+        <a href="${basePath || '/'}">Upload another</a>
+        <div>
+          <p class="eyebrow">Picture mode</p>
+          <h1>Server-rendered model</h1>
+          <nav class="viewer-mode-links" aria-label="Viewer modes">
+            <a href="${basePath}/models/${modelId}">3D</a>
+            <a aria-current="page" href="${basePath}/models/${modelId}/picture">Picture</a>
+          </nav>
+        </div>
+      </header>
+      <section class="viewer-shell picture-shell">
+        <img id="rendered-picture" class="rendered-picture" alt="Server-rendered preview of the shared 3D model" hidden />
+        <div class="picture-help">Left-drag to orbit. Right-drag to pan. Scroll or pinch to zoom.</div>
+        <div id="viewer-status" class="viewer-status viewer-loading picture-rendering-status" role="status" aria-live="polite">
+          <div class="viewer-loading-label">
+            <span id="viewer-loading-stage">Warming server renderer...</span>
+            <span id="viewer-loading-percent">Loading</span>
+          </div>
+          <progress id="viewer-loading-bar">Loading</progress>
+        </div>
+      </section>
+    </main>
+  `;
+
+  const image = document.querySelector('#rendered-picture');
+  const status = document.querySelector('#viewer-status');
+  const shell = document.querySelector('.picture-shell');
+  const cameraState = {
+    yaw: 0,
+    pitch: 0,
+    zoom: 1,
+    fov: 45,
+    panX: 0,
+    panY: 0,
+  };
+  const streamState = {
+    dirty: true,
+    inFlight: false,
+    pointerId: null,
+    lastX: 0,
+    lastY: 0,
+    dragMode: 'orbit',
+    resolutionIndex: 0,
+    requestStartedAt: null,
+    lastDelayMs: null,
+    cameraChangedInFlight: false,
+    hasDisplayedImage: false,
+  };
+
+  image.addEventListener('load', () => {
+    const wasWaitingForFirstImage = !streamState.hasDisplayedImage;
+    if (streamState.requestStartedAt !== null) {
+      streamState.lastDelayMs = performance.now() - streamState.requestStartedAt;
+      streamState.requestStartedAt = null;
+      if (streamState.cameraChangedInFlight) {
+        streamState.resolutionIndex = 0;
+        streamState.lastDelayMs = null;
+      } else if (wasWaitingForFirstImage && streamState.resolutionIndex < pictureResolutionLevels.length - 1) {
+        streamState.resolutionIndex += 1;
+        streamState.lastDelayMs = null;
+        streamState.dirty = true;
+      } else if (adaptPictureResolution(streamState)) {
+        streamState.dirty = true;
+      }
+    }
+
+    if (!streamState.cameraChangedInFlight || streamState.hasDisplayedImage) {
+      image.hidden = false;
+      streamState.hasDisplayedImage = true;
+      shell.classList.add('is-ready');
+    }
+    streamState.cameraChangedInFlight = false;
+    status.hidden = true;
+    streamState.inFlight = false;
+    requestLatestPicture(modelId, image, status, cameraState, streamState);
+  });
+  image.addEventListener('error', () => {
+    status.className = 'viewer-status error';
+    status.textContent = 'Unable to load the server-rendered picture.';
+    streamState.inFlight = false;
+  });
+  requestLatestPicture(modelId, image, status, cameraState, streamState);
+
+  shell.addEventListener('pointerdown', (event) => {
+    event.preventDefault();
+    shell.setPointerCapture(event.pointerId);
+    streamState.pointerId = event.pointerId;
+    streamState.lastX = event.clientX;
+    streamState.lastY = event.clientY;
+    streamState.dragMode = event.button === 2 ? 'pan' : 'orbit';
+    shell.classList.add('dragging');
+  });
+
+  shell.addEventListener('pointermove', (event) => {
+    if (streamState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const deltaX = event.clientX - streamState.lastX;
+    const deltaY = event.clientY - streamState.lastY;
+    streamState.lastX = event.clientX;
+    streamState.lastY = event.clientY;
+    if (streamState.dragMode === 'pan') {
+      cameraState.panX -= deltaX * 0.002;
+      cameraState.panY += deltaY * 0.002;
+    } else {
+      cameraState.yaw -= deltaX * 0.01;
+      cameraState.pitch = clamp(cameraState.pitch - deltaY * 0.01, -Math.PI + 0.1, Math.PI - 0.1);
+    }
+
+    markPictureDirty(modelId, image, status, cameraState, streamState);
+  });
+
+  shell.addEventListener('pointerup', (event) => {
+    if (streamState.pointerId === event.pointerId) {
+      streamState.pointerId = null;
+      shell.classList.remove('dragging');
+    }
+  });
+
+  shell.addEventListener('pointercancel', () => {
+    streamState.pointerId = null;
+    shell.classList.remove('dragging');
+  });
+
+  shell.addEventListener('wheel', (event) => {
+    event.preventDefault();
+    cameraState.zoom = clamp(cameraState.zoom * Math.exp(event.deltaY * 0.001), 0.08, 12);
+    markPictureDirty(modelId, image, status, cameraState, streamState);
+  }, { passive: false });
+
+  shell.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+  });
+}
+
+function renderSnapshot(modelId) {
+  app.innerHTML = `
+    <main class="snapshot-page">
+      <div id="canvas-host" class="canvas-host"></div>
+      <div id="viewer-status" class="viewer-status viewer-loading" hidden>
+        <div class="viewer-loading-label">
+          <span id="viewer-loading-stage">Loading model...</span>
+          <span id="viewer-loading-percent">0%</span>
+        </div>
+        <progress id="viewer-loading-bar" max="100" value="0">0%</progress>
+      </div>
+    </main>
+  `;
+
+  window.__MODEL_VISUALIZER_READY__ = false;
+  window.__MODEL_VISUALIZER_ERROR__ = null;
+  loadModel(modelId, {
+    snapshot: true,
+    onReady: () => {
+      window.__MODEL_VISUALIZER_READY__ = true;
+    },
+    onError: (error) => {
+      window.__MODEL_VISUALIZER_ERROR__ = error.stack || error.message;
+    },
+  }).catch((error) => {
+    window.__MODEL_VISUALIZER_ERROR__ = error.stack || error.message;
+  });
+}
+
+async function loadModel(modelId, options = {}) {
   const host = document.querySelector('#canvas-host');
   const status = document.querySelector('#viewer-status');
   const loadingStage = document.querySelector('#viewer-loading-stage');
@@ -305,7 +502,10 @@ async function loadModel(modelId) {
     applyDefaultMaterial(object);
     scene.add(object);
     frameObject(object, camera, controls);
-    if (manifest.missingMaterials?.length > 0) {
+    installSnapshotCameraControls(camera, controls);
+    renderOnce(renderer, scene, camera, controls, options.onReady);
+
+    if (!options.snapshot && manifest.missingMaterials?.length > 0) {
       status.hidden = false;
       status.className = 'viewer-status warning';
       status.textContent = `Rendered without some colors: missing ${manifest.missingMaterials.join(', ')}. Re-upload the OBJ together with its MTL/material files.`;
@@ -315,11 +515,57 @@ async function loadModel(modelId) {
   } catch (error) {
     status.className = 'viewer-status error';
     status.textContent = `Unable to load model: ${error.message}`;
+    options.onError?.(error);
   }
 
   renderer.setAnimationLoop(() => {
     controls.update();
     renderer.render(scene, camera);
+  });
+}
+
+function installSnapshotCameraControls(camera, controls) {
+  const baseTarget = controls.target.clone();
+  const baseSpherical = new THREE.Spherical().setFromVector3(camera.position.clone().sub(baseTarget));
+  const baseRadius = baseSpherical.radius;
+
+  window.__MODEL_VISUALIZER_SET_CAMERA__ = (state) => new Promise((resolve) => {
+    const nextState = state || {};
+    const spherical = baseSpherical.clone();
+    spherical.theta += Number(nextState.yaw || 0);
+    spherical.phi = clamp(spherical.phi + Number(nextState.pitch || 0), 0.05, Math.PI - 0.05);
+    spherical.radius *= Number(nextState.zoom || 1);
+
+    const relativePosition = new Vector3().setFromSpherical(spherical);
+    camera.position.copy(baseTarget).add(relativePosition);
+    camera.fov = Number(nextState.fov || 45);
+    camera.updateProjectionMatrix();
+    controls.target.copy(baseTarget);
+    controls.update();
+
+    const right = new Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+    const up = new Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
+    const panOffset = right
+      .multiplyScalar(Number(nextState.panX || 0) * baseRadius)
+      .add(up.multiplyScalar(Number(nextState.panY || 0) * baseRadius));
+    controls.target.copy(baseTarget).add(panOffset);
+    camera.position.add(panOffset);
+    controls.update();
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(resolve);
+    });
+  });
+}
+
+function renderOnce(renderer, scene, camera, controls, onReady) {
+  requestAnimationFrame(() => {
+    controls.update();
+    renderer.render(scene, camera);
+    requestAnimationFrame(() => {
+      renderer.render(scene, camera);
+      onReady?.();
+    });
   });
 }
 
@@ -342,6 +588,71 @@ function updateViewerProgress({ loadingBar, loadingStage, loadingPercent }, valu
   loadingBar.textContent = `${percent}%`;
   loadingStage.textContent = label;
   loadingPercent.textContent = `${percent}%`;
+}
+
+function markPictureDirty(modelId, image, status, cameraState, streamState) {
+  streamState.dirty = true;
+  if (streamState.inFlight) {
+    streamState.cameraChangedInFlight = true;
+  } else {
+    streamState.resolutionIndex = 0;
+    streamState.lastDelayMs = null;
+  }
+
+  requestLatestPicture(modelId, image, status, cameraState, streamState);
+}
+
+function requestLatestPicture(modelId, image, status, cameraState, streamState) {
+  if (!streamState.dirty || streamState.inFlight) {
+    return;
+  }
+
+  streamState.dirty = false;
+  streamState.inFlight = true;
+  const resolution = pictureResolutionLevels[streamState.resolutionIndex];
+  streamState.requestStartedAt = performance.now();
+  status.hidden = false;
+  status.className = 'viewer-status viewer-loading picture-rendering-status';
+  status.innerHTML = `
+    <div class="viewer-loading-label">
+      <span>Rendering latest view at ${resolution.width}x${resolution.height}...</span>
+      <span>${streamState.lastDelayMs === null ? 'Live' : `${Math.round(streamState.lastDelayMs)}ms`}</span>
+    </div>
+    <progress>Rendering</progress>
+  `;
+
+  const params = new URLSearchParams({
+    yaw: cameraState.yaw.toFixed(4),
+    pitch: cameraState.pitch.toFixed(4),
+    zoom: cameraState.zoom.toFixed(4),
+    fov: String(cameraState.fov),
+    panX: cameraState.panX.toFixed(4),
+    panY: cameraState.panY.toFixed(4),
+    width: String(resolution.width),
+    height: String(resolution.height),
+    t: String(Date.now()),
+  });
+  image.src = `${basePath}/api/models/${modelId}/render.png?${params}`;
+}
+
+function adaptPictureResolution(streamState) {
+  if (streamState.lastDelayMs === null) {
+    return false;
+  }
+
+  const maxIndex = pictureResolutionLevels.length - 1;
+  if (streamState.lastDelayMs < pictureTargetDelayMs * 0.85 && streamState.resolutionIndex < maxIndex) {
+    streamState.resolutionIndex += 1;
+    return true;
+  } else if (streamState.lastDelayMs > pictureTargetDelayMs * 1.3 && streamState.resolutionIndex > 0) {
+    streamState.resolutionIndex -= 1;
+  }
+
+  return false;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function applyDefaultMaterial(object) {

@@ -9,6 +9,7 @@ A web app for uploading Wavefront OBJ models and sharing browser-viewable 3D ren
 - Stores uploaded assets on disk and returns a shareable viewer URL.
 - Renders shared models with Three.js, OBJLoader, MTLLoader, and orbit controls.
 - Shows model-loading progress in the fullscreen viewer.
+- Provides a server-rendered picture mode that sends a cached PNG instead of the full model to viewers.
 - Reports safe debug information when uploads fail.
 - Supports large uploads through configurable size and timeout limits.
 
@@ -40,6 +41,11 @@ npm start
 | `MAX_UPLOAD_FILES` | `20` | Maximum number of files in one upload. |
 | `UPLOAD_TIMEOUT_MS` | `1800000` | Server request timeout for uploads. |
 | `TEMP_UPLOAD_MAX_AGE_MS` | `86400000` | Age after which interrupted temporary uploads are cleaned up. |
+| `CHROMIUM_PATH` | auto-detected | Chromium executable path used for server-rendered picture mode. |
+| `RENDER_WIDTH` | `1280` | Width of generated server-side PNG renders. |
+| `RENDER_HEIGHT` | `900` | Height of generated server-side PNG renders. |
+| `RENDER_TIMEOUT_MS` | `600000` | Maximum time allowed for one server-side render. |
+| `RENDER_SESSION_TTL_MS` | `60000` | Time to keep a model render session hot after a picture render. |
 
 ## Docker
 

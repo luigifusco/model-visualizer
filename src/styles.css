@@ -266,12 +266,42 @@ h1 {
   background: rgba(2, 6, 23, 0.6);
 }
 
+.viewer-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
 .viewer-link {
   display: inline-flex;
   align-items: center;
   min-height: 44px;
   margin-top: 0.75rem;
   font-weight: 800;
+}
+
+.viewer-mode-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.viewer-mode-links a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  border: 1px solid rgba(147, 197, 253, 0.35);
+  border-radius: 999px;
+  padding: 0 0.85rem;
+  color: #bfdbfe;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.viewer-mode-links a[aria-current="page"] {
+  color: #06101f;
+  background: linear-gradient(135deg, #7dd3fc, #c4b5fd);
 }
 
 .viewer-page {
@@ -281,6 +311,74 @@ h1 {
   margin: 0;
   overflow: hidden;
   padding: 0;
+}
+
+.snapshot-page,
+.picture-page {
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.picture-shell {
+  display: grid;
+  place-items: center;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.picture-shell.dragging {
+  cursor: grabbing;
+}
+
+.rendered-picture {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #0b1020;
+  pointer-events: none;
+}
+
+.rendered-picture[hidden],
+.picture-shell:not(.is-ready) .picture-help {
+  display: none;
+}
+
+.picture-help {
+  position: fixed;
+  z-index: 10;
+  left: 50%;
+  bottom: 1rem;
+  max-width: min(560px, calc(100vw - 2rem));
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 999px;
+  padding: 0.65rem 0.9rem;
+  color: #cbd5e1;
+  background: rgba(15, 23, 42, 0.72);
+  font-size: 0.9rem;
+  font-weight: 800;
+  text-align: center;
+  transform: translateX(-50%);
+}
+
+.viewer-status.picture-rendering-status {
+  top: 0.75rem;
+  left: 50%;
+  width: min(360px, calc(100vw - 2rem));
+  min-width: 0;
+  border-radius: 999px;
+  padding: 0.35rem 0.75rem 0.45rem;
+  transform: translateX(-50%);
+}
+
+.picture-rendering-status .viewer-loading-label {
+  font-size: 0.78rem;
+}
+
+.picture-rendering-status progress {
+  height: 4px;
 }
 
 .viewer-header {

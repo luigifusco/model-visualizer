@@ -16,9 +16,12 @@ ENV NODE_ENV=production \
     PORT=8080 \
     BASE_PATH=/model-visualizer \
     PUBLIC_BASE_URL=https://luigifusco.dev/model-visualizer \
-    UPLOAD_DIR=/app/uploads
+    UPLOAD_DIR=/app/uploads \
+    CHROMIUM_PATH=/usr/bin/chromium-browser
 
 WORKDIR /app
+
+RUN apk add --no-cache chromium mesa-dri-gallium mesa-egl mesa-gbm mesa-gl xvfb
 
 COPY package*.json ./
 RUN npm ci --omit=dev
