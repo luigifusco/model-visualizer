@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import multer from 'multer';
 import puppeteer from 'puppeteer-core';
+import { WebSocket, WebSocketServer } from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,6 +21,7 @@ const publicBaseUrl = normalizePublicBaseUrl(
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
 const uploadTmpDir = path.join(uploadDir, '.tmp');
 const renderCacheDir = path.join(uploadDir, 'renders');
+const modelMetadataFileName = 'metadata.json';
 const maxUploadBytes = Number(process.env.MAX_UPLOAD_BYTES || 100 * 1024 * 1024);
 const maxUploadFiles = Number(process.env.MAX_UPLOAD_FILES || 20);
 const uploadTimeoutMs = Number(process.env.UPLOAD_TIMEOUT_MS || 30 * 60 * 1000);
@@ -28,9 +30,11 @@ const renderWidth = Number(process.env.RENDER_WIDTH || 1280);
 const renderHeight = Number(process.env.RENDER_HEIGHT || 900);
 const renderTimeoutMs = Number(process.env.RENDER_TIMEOUT_MS || 10 * 1000);
 const renderSessionTtlMs = Number(process.env.RENDER_SESSION_TTL_MS || 60 * 1000);
+const renderChromiumMode = process.env.RENDER_CHROMIUM_MODE || 'gpu';
 const isProduction = process.env.NODE_ENV === 'production';
 const renderJobs = new Map();
 const renderSessions = new Map();
+const renderStreamServer = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 });
 const allowedUploadExtensions = new Set([
   '.obj',
   '.mtl',
@@ -137,6 +141,17 @@ api.post('/models', upload.any(), (req, res) => {
       storedFileNames.add(normalizedName);
       fs.renameSync(file.path, path.join(finalDir, storedName));
     }
+    writeModelMetadata(finalDir, {
+      id,
+      originalName: objFiles[0].originalname,
+      uploadedAt: new Date().toISOString(),
+      files: files.map((file) => ({
+        originalName: file.originalname,
+        storedName: file === objFiles[0] ? 'model.obj' : getSafeOriginalFileName(file.originalname),
+        size: file.size,
+        type: file.mimetype || null,
+      })),
+    });
   } catch (error) {
     cleanupTempFiles(files);
     fs.rmSync(finalDir, { recursive: true, force: true });
@@ -155,7 +170,15 @@ api.post('/models', upload.any(), (req, res) => {
   });
 });
 
-api.get('/models/:id/manifest', (req, res) => {
+api.get('/models', (_req, res, next) => {
+  try {
+    res.json({ models: listStoredModels() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+api.get('/models/:id/manifest', requireInternalRenderRequest, (req, res) => {
   const id = req.params.id;
   if (!isValidModelId(id)) {
     res.status(400).json({ error: 'Invalid model id.' });
@@ -184,7 +207,7 @@ api.get('/models/:id/manifest', (req, res) => {
   });
 });
 
-api.get('/models/:id/file', (req, res) => {
+api.get('/models/:id/file', requireInternalRenderRequest, (req, res) => {
   const id = req.params.id;
   if (!isValidModelId(id)) {
     res.status(400).json({ error: 'Invalid model id.' });
@@ -218,7 +241,7 @@ api.get('/models/:id/render.png', async (req, res, next) => {
     if (cameraState) {
       const buffer = await renderModelImageBuffer(id, modelPath, cameraState);
       res.setHeader('Cache-Control', 'no-store');
-      res.type('png').send(buffer);
+      res.type(cameraState.format).send(buffer);
       return;
     }
 
@@ -230,7 +253,7 @@ api.get('/models/:id/render.png', async (req, res, next) => {
   }
 });
 
-api.get('/models/:id/assets/:filename', (req, res) => {
+api.get('/models/:id/assets/:filename', requireInternalRenderRequest, (req, res) => {
   const id = req.params.id;
   const filename = req.params.filename;
   if (!isValidModelId(id) || !isSafeFileName(filename)) {
@@ -320,6 +343,28 @@ const server = app.listen(port, () => {
   );
 });
 
+server.on('upgrade', (req, socket, head) => {
+  const streamRequest = getRenderStreamRequest(req);
+  if (!streamRequest) {
+    socket.destroy();
+    return;
+  }
+
+  if (!streamRequest.ok) {
+    socket.write(`HTTP/1.1 ${streamRequest.status} ${streamRequest.message}\r\nConnection: close\r\n\r\n`);
+    socket.destroy();
+    return;
+  }
+
+  renderStreamServer.handleUpgrade(req, socket, head, (ws) => {
+    renderStreamServer.emit('connection', ws, req, streamRequest);
+  });
+});
+
+renderStreamServer.on('connection', (ws, _req, { id, modelPath }) => {
+  handleRenderStream(ws, id, modelPath);
+});
+
 server.requestTimeout = uploadTimeoutMs;
 server.headersTimeout = Math.min(120 * 1000, uploadTimeoutMs);
 server.keepAliveTimeout = 65 * 1000;
@@ -346,6 +391,40 @@ function isValidModelId(id) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 }
 
+function requireInternalRenderRequest(req, res, next) {
+  if (isLoopbackAddress(req.socket.remoteAddress)) {
+    next();
+    return;
+  }
+
+  res.status(404).json({ error: 'Model asset not found.' });
+}
+
+function isLoopbackAddress(address) {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+function getRenderStreamRequest(req) {
+  const url = new URL(req.url || '/', 'http://localhost');
+  const prefix = joinRoute(basePath, '/api/models/');
+  const suffix = '/render-stream';
+  if (!url.pathname.startsWith(prefix) || !url.pathname.endsWith(suffix)) {
+    return null;
+  }
+
+  const id = url.pathname.slice(prefix.length, -suffix.length);
+  if (!isValidModelId(id)) {
+    return { ok: false, status: 400, message: 'Invalid model id.' };
+  }
+
+  const modelPath = getModelFilePath(id);
+  if (!modelPath) {
+    return { ok: false, status: 404, message: 'Model not found.' };
+  }
+
+  return { ok: true, id, modelPath };
+}
+
 function getModelFilePath(id) {
   const directoryModelPath = path.join(uploadDir, id, 'model.obj');
   if (fs.existsSync(directoryModelPath)) {
@@ -354,6 +433,111 @@ function getModelFilePath(id) {
 
   const legacyModelPath = path.join(uploadDir, `${id}.obj`);
   return fs.existsSync(legacyModelPath) ? legacyModelPath : null;
+}
+
+function listStoredModels() {
+  const models = [];
+  const entries = fs.readdirSync(uploadDir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (entry.isDirectory() && isValidModelId(entry.name)) {
+      const modelPath = path.join(uploadDir, entry.name, 'model.obj');
+      if (fs.existsSync(modelPath)) {
+        models.push(getDirectoryModelMetadata(entry.name, modelPath));
+      }
+      continue;
+    }
+
+    if (entry.isFile() && entry.name.toLowerCase().endsWith('.obj')) {
+      const id = path.basename(entry.name, '.obj');
+      if (isValidModelId(id)) {
+        models.push(getLegacyModelMetadata(id, path.join(uploadDir, entry.name)));
+      }
+    }
+  }
+
+  return models.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+}
+
+function getDirectoryModelMetadata(id, modelPath) {
+  const modelDir = path.dirname(modelPath);
+  const modelStats = fs.statSync(modelPath);
+  const dirStats = fs.statSync(modelDir);
+  const metadata = readModelMetadata(modelDir);
+  const assetNames = getAssetNames(id);
+  const materialNames = assetNames.filter((name) => path.extname(name).toLowerCase() === '.mtl');
+  const textureNames = assetNames.filter((name) => isTextureExtension(path.extname(name).toLowerCase()));
+  const referencedMaterials = getReferencedMaterialNames(modelPath);
+  const renderPath = getRenderImagePath(id);
+
+  return {
+    id,
+    name: metadata?.originalName || 'model.obj',
+    viewerUrl: `${publicBaseUrl}/models/${id}`,
+    uploadedAt: metadata?.uploadedAt || dirStats.birthtime.toISOString(),
+    updatedAt: dirStats.mtime.toISOString(),
+    storageType: 'directory',
+    modelSizeBytes: modelStats.size,
+    totalSizeBytes: getDirectorySize(modelDir, new Set([modelMetadataFileName, 'render.png'])),
+    assetCount: assetNames.length,
+    materialCount: materialNames.length,
+    textureCount: textureNames.length,
+    missingMaterials: referencedMaterials.filter(
+      (name) => !materialNames.some((assetName) => assetName.toLowerCase() === name.toLowerCase()),
+    ),
+    renderCached: fs.existsSync(renderPath),
+    renderUpdatedAt: fs.existsSync(renderPath) ? fs.statSync(renderPath).mtime.toISOString() : null,
+  };
+}
+
+function getLegacyModelMetadata(id, modelPath) {
+  const stats = fs.statSync(modelPath);
+  const renderPath = getRenderImagePath(id);
+  return {
+    id,
+    name: path.basename(modelPath),
+    viewerUrl: `${publicBaseUrl}/models/${id}`,
+    uploadedAt: stats.birthtime.toISOString(),
+    updatedAt: stats.mtime.toISOString(),
+    storageType: 'legacy-file',
+    modelSizeBytes: stats.size,
+    totalSizeBytes: stats.size,
+    assetCount: 0,
+    materialCount: 0,
+    textureCount: 0,
+    missingMaterials: getReferencedMaterialNames(modelPath),
+    renderCached: fs.existsSync(renderPath),
+    renderUpdatedAt: fs.existsSync(renderPath) ? fs.statSync(renderPath).mtime.toISOString() : null,
+  };
+}
+
+function writeModelMetadata(modelDir, metadata) {
+  fs.writeFileSync(path.join(modelDir, modelMetadataFileName), `${JSON.stringify(metadata, null, 2)}\n`);
+}
+
+function readModelMetadata(modelDir) {
+  const metadataPath = path.join(modelDir, modelMetadataFileName);
+  if (!fs.existsSync(metadataPath)) {
+    return null;
+  }
+
+  return JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+}
+
+function getDirectorySize(directory, ignoredFileNames = new Set()) {
+  let size = 0;
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isFile() || ignoredFileNames.has(entry.name)) {
+      continue;
+    }
+    size += fs.statSync(path.join(directory, entry.name)).size;
+  }
+
+  return size;
+}
+
+function isTextureExtension(extension) {
+  return ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'].includes(extension);
 }
 
 async function ensureModelRender(id, modelPath, refresh) {
@@ -406,7 +590,11 @@ async function renderModelImageBuffer(id, modelPath, cameraState) {
   const buffer = await withRenderSession(session, async () => {
     await setRenderViewport(session, cameraState.width, cameraState.height);
     await applyRenderCamera(session, cameraState);
-    return session.page.screenshot({ type: 'png', timeout: renderTimeoutMs });
+    return session.page.screenshot(removeUndefined({
+      type: cameraState.format,
+      quality: cameraState.format === 'png' ? undefined : cameraState.quality,
+      timeout: renderTimeoutMs,
+    }));
   });
 
   console.log('model-visualizer rendered live picture', {
@@ -418,6 +606,76 @@ async function renderModelImageBuffer(id, modelPath, cameraState) {
   session.renderCount += 1;
   touchRenderSession(id, session);
   return buffer;
+}
+
+function handleRenderStream(ws, id, modelPath) {
+  let pendingState = null;
+  let rendering = false;
+
+  ws.send(JSON.stringify({
+    type: 'ready',
+    id,
+    maxWidth: renderWidth,
+    maxHeight: renderHeight,
+    mimeType: 'image/jpeg',
+  }));
+
+  ws.on('message', (data) => {
+    try {
+      pendingState = parseRenderStreamMessage(data);
+      pumpRenderStream().catch((error) => sendRenderStreamError(ws, error));
+    } catch (error) {
+      sendRenderStreamError(ws, error);
+    }
+  });
+
+  async function pumpRenderStream() {
+    if (rendering) {
+      return;
+    }
+
+    rendering = true;
+    try {
+      while (pendingState && ws.readyState === WebSocket.OPEN) {
+        const cameraState = pendingState;
+        pendingState = null;
+        const startedAt = Date.now();
+        const buffer = await renderModelImageBuffer(id, modelPath, cameraState);
+        if (ws.readyState !== WebSocket.OPEN) {
+          return;
+        }
+
+        ws.send(JSON.stringify({
+          type: 'frame',
+          requestId: cameraState.requestId,
+          mode: cameraState.mode,
+          width: cameraState.width,
+          height: cameraState.height,
+          quality: cameraState.quality,
+          renderMs: Date.now() - startedAt,
+          mimeType: 'image/jpeg',
+        }));
+        ws.send(buffer, { binary: true });
+      }
+    } finally {
+      rendering = false;
+      if (pendingState && ws.readyState === WebSocket.OPEN) {
+        pumpRenderStream().catch((error) => sendRenderStreamError(ws, error));
+      }
+    }
+  }
+}
+
+function sendRenderStreamError(ws, error) {
+  if (ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  ws.send(JSON.stringify({
+    type: 'error',
+    code: error.code || 'RENDER_STREAM_ERROR',
+    error: error.message || 'Render stream failed.',
+  }));
 }
 
 async function withRenderSession(session, task) {
@@ -508,28 +766,12 @@ async function getRenderSession(id, modelPath) {
 }
 
 async function createRenderSession(id, modelPath) {
-  const virtualDisplay = await startVirtualDisplay();
-  let browser;
+  let launch;
 
   try {
-    browser = await puppeteer.launch({
-      executablePath: getChromiumPath(),
-      headless: virtualDisplay.display ? false : 'new',
-      env: {
-        ...process.env,
-        ...(virtualDisplay.display ? { DISPLAY: virtualDisplay.display } : {}),
-      },
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--enable-webgl',
-        '--ignore-gpu-blocklist',
-        '--hide-scrollbars',
-      ],
-    });
+    launch = await launchRenderBrowser();
 
-    const page = await browser.newPage();
+    const page = await launch.browser.newPage();
     const pageMessages = [];
     page.on('console', (message) => {
       pageMessages.push(`[${message.type()}] ${message.text()}`);
@@ -559,16 +801,21 @@ async function createRenderSession(id, modelPath) {
       throw error;
     }
 
+    const rendererInfo = await getWebglRendererInfo(page);
     console.log('model-visualizer warmed render session', {
       id,
       modelBytes: fs.statSync(modelPath).size,
+      chromiumMode: launch.mode,
+      rendererInfo,
     });
 
     return {
       id,
-      browser,
+      browser: launch.browser,
       page,
-      virtualDisplay,
+      virtualDisplay: launch.virtualDisplay,
+      chromiumMode: launch.mode,
+      rendererInfo,
       pageMessages,
       renderCount: 0,
       queue: Promise.resolve(),
@@ -578,10 +825,81 @@ async function createRenderSession(id, modelPath) {
       cleanupTimer: null,
     };
   } catch (error) {
-    await browser?.close();
-    virtualDisplay.stop();
+    await launch?.browser?.close();
+    launch?.virtualDisplay?.stop();
     throw error;
   }
+}
+
+async function launchRenderBrowser() {
+  const modes = renderChromiumMode === 'xvfb' ? ['xvfb'] : ['gpu', 'xvfb'];
+  let lastError;
+
+  for (const mode of modes) {
+    const virtualDisplay = mode === 'xvfb' ? await startVirtualDisplay() : createEmptyVirtualDisplay();
+    try {
+      const browser = await puppeteer.launch({
+        executablePath: getChromiumPath(),
+        headless: mode === 'xvfb' && virtualDisplay.display ? false : 'new',
+        env: {
+          ...process.env,
+          ...(virtualDisplay.display ? { DISPLAY: virtualDisplay.display } : {}),
+        },
+        args: getChromiumArgs(mode),
+      });
+
+      return { browser, virtualDisplay, mode };
+    } catch (error) {
+      lastError = error;
+      virtualDisplay.stop();
+      console.error('model-visualizer Chromium launch failed', {
+        mode,
+        message: error.message,
+      });
+    }
+  }
+
+  throw lastError;
+}
+
+function getChromiumArgs(mode) {
+  const args = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--enable-webgl',
+    '--ignore-gpu-blocklist',
+    '--hide-scrollbars',
+  ];
+
+  if (mode === 'gpu') {
+    args.push(
+      '--use-gl=angle',
+      '--use-angle=gl-egl',
+      '--ozone-platform=headless',
+      '--enable-gpu-rasterization',
+    );
+  }
+
+  return args;
+}
+
+async function getWebglRendererInfo(page) {
+  return page.evaluate(() => {
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    if (!gl) {
+      return { webgl: false };
+    }
+
+    const debug = gl.getExtension('WEBGL_debug_renderer_info');
+    return {
+      webgl: true,
+      vendor: debug ? gl.getParameter(debug.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR),
+      renderer: debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+      version: gl.getParameter(gl.VERSION),
+    };
+  });
 }
 
 function touchRenderSession(id, session) {
@@ -602,7 +920,7 @@ function touchRenderSession(id, session) {
 }
 
 function parseRenderCameraQuery(query) {
-  const hasCameraParam = ['yaw', 'pitch', 'zoom', 'fov', 'panX', 'panY', 'width', 'height'].some(
+  const hasCameraParam = ['yaw', 'pitch', 'zoom', 'fov', 'panX', 'panY', 'width', 'height', 'format', 'quality'].some(
     (key) => query[key] !== undefined,
   );
   if (!hasCameraParam) {
@@ -616,9 +934,51 @@ function parseRenderCameraQuery(query) {
     fov: parseBoundedNumber(query.fov, 10, 100, 45),
     panX: parseBoundedNumber(query.panX, -100, 100, 0),
     panY: parseBoundedNumber(query.panY, -100, 100, 0),
-    width: Math.round(parseBoundedNumber(query.width, 120, renderWidth, renderWidth)),
-    height: Math.round(parseBoundedNumber(query.height, 80, renderHeight, renderHeight)),
+    width: Math.round(parseBoundedNumber(query.width, 64, renderWidth, renderWidth)),
+    height: Math.round(parseBoundedNumber(query.height, 64, renderHeight, renderHeight)),
+    format: parseRenderFormat(query.format, 'png'),
+    quality: Math.round(parseBoundedNumber(query.quality, 30, 95, 80)),
   };
+}
+
+function parseRenderStreamMessage(data) {
+  const payload = JSON.parse(data.toString('utf8'));
+  if (payload?.type !== 'camera') {
+    const error = new Error('Unsupported render stream message.');
+    error.code = 'INVALID_STREAM_MESSAGE';
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return {
+    requestId: Number.isSafeInteger(Number(payload.requestId)) ? Number(payload.requestId) : Date.now(),
+    mode: payload.mode === 'still' ? 'still' : 'interactive',
+    yaw: parseBoundedNumber(payload.yaw, -100, 100, 0),
+    pitch: parseBoundedNumber(payload.pitch, -Math.PI + 0.05, Math.PI - 0.05, 0),
+    zoom: parseBoundedNumber(payload.zoom, 0.05, 20, 1),
+    fov: parseBoundedNumber(payload.fov, 10, 100, 45),
+    panX: parseBoundedNumber(payload.panX, -100, 100, 0),
+    panY: parseBoundedNumber(payload.panY, -100, 100, 0),
+    width: Math.round(parseBoundedNumber(payload.width, 64, renderWidth, 320)),
+    height: Math.round(parseBoundedNumber(payload.height, 64, renderHeight, 225)),
+    format: 'jpeg',
+    quality: Math.round(parseBoundedNumber(payload.quality, 30, 90, 60)),
+  };
+}
+
+function parseRenderFormat(value, fallback) {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  if (value === 'png' || value === 'jpeg') {
+    return value;
+  }
+
+  const error = new Error('Invalid render format: expected png or jpeg.');
+  error.code = 'INVALID_CAMERA';
+  error.statusCode = 400;
+  throw error;
 }
 
 function parseBoundedNumber(value, min, max, fallback) {
@@ -712,6 +1072,13 @@ async function startVirtualDisplay() {
   };
 }
 
+function createEmptyVirtualDisplay() {
+  return {
+    display: null,
+    stop() {},
+  };
+}
+
 function getRenderImagePath(id) {
   const modelDir = path.join(uploadDir, id);
   if (fs.existsSync(modelDir) && fs.statSync(modelDir).isDirectory()) {
@@ -749,7 +1116,13 @@ function getAssetNames(id) {
 
   return fs
     .readdirSync(modelDir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name !== 'model.obj' && isSafeFileName(entry.name))
+    .filter((entry) => (
+      entry.isFile()
+      && entry.name !== 'model.obj'
+      && entry.name !== modelMetadataFileName
+      && entry.name !== 'render.png'
+      && isSafeFileName(entry.name)
+    ))
     .map((entry) => entry.name);
 }
 

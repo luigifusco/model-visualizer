@@ -6,18 +6,10 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 
-const pictureResolutionLevels = [
-  { width: 160, height: 113 },
-  { width: 240, height: 169 },
-  { width: 320, height: 225 },
-  { width: 480, height: 338 },
-  { width: 640, height: 450 },
-  { width: 800, height: 563 },
-  { width: 960, height: 675 },
-  { width: 1120, height: 788 },
-  { width: 1280, height: 900 },
-];
-const pictureTargetDelayMs = 500;
+const pictureWarmupFrame = { maxSide: 180, maxWidth: 180, maxHeight: 180, quality: 45 };
+const pictureInteractiveFrame = { maxSide: 360, maxWidth: 480, maxHeight: 480, quality: 55 };
+const pictureStillFrame = { maxSide: 1280, maxWidth: 1280, maxHeight: 900, quality: 82 };
+const pictureStillDelayMs = 350;
 
 const app = document.querySelector('#app');
 const basePath = getBasePath();
@@ -25,8 +17,10 @@ const route = getRoute();
 
 if (route.startsWith('/snapshot/')) {
   renderSnapshot(route.split('/')[2]);
+} else if (route === '/models') {
+  renderModelList();
 } else if (route.startsWith('/models/')) {
-  renderViewer(route.split('/')[2]);
+  renderPictureViewer(route.split('/')[2]);
 } else {
   renderUploader();
 }
@@ -38,6 +32,7 @@ function renderUploader() {
         <p class="eyebrow">OBJ sharing</p>
         <h1>Upload a 3D model and share a viewer URL.</h1>
         <p class="lede">Choose a Wavefront <code>.obj</code> file. Add its <code>.mtl</code> and texture images too when the model uses colors or materials.</p>
+        <p class="lede secondary-link"><a href="${basePath}/models">Browse uploaded models</a></p>
       </section>
 
       <section class="card">
@@ -124,8 +119,7 @@ function renderUploader() {
           <button id="copy-button" type="button">Copy</button>
         </div>
         <div class="viewer-links">
-          <a class="viewer-link" href="${escapeAttribute(toLocalUrl(payload.url))}">Open 3D viewer</a>
-          <a class="viewer-link" href="${escapeAttribute(`${toLocalUrl(payload.url)}/picture`)}">Open picture mode</a>
+          <a class="viewer-link" href="${escapeAttribute(toLocalUrl(payload.url))}">Open viewer</a>
         </div>
       `;
       result.hidden = false;
@@ -220,59 +214,73 @@ function createUploadError(message, debug) {
   return error;
 }
 
-function renderViewer(modelId) {
-  const isPictureMode = route === `/models/${modelId}/picture`;
-  if (isPictureMode) {
-    renderPictureViewer(modelId);
-    return;
-  }
-
+async function renderModelList() {
   app.innerHTML = `
-    <main class="viewer-page">
-      <header class="viewer-header">
-        <a href="${basePath || '/'}">Upload another</a>
-        <div>
-          <p class="eyebrow">3D viewer</p>
-          <h1>Shared OBJ model</h1>
-          <nav class="viewer-mode-links" aria-label="Viewer modes">
-            <a aria-current="page" href="${basePath}/models/${modelId}">3D</a>
-            <a href="${basePath}/models/${modelId}/picture">Picture</a>
-          </nav>
-        </div>
-      </header>
-      <section class="viewer-shell">
-        <div id="canvas-host" class="canvas-host"></div>
-        <div id="viewer-status" class="viewer-status viewer-loading" role="status" aria-live="polite">
-          <div class="viewer-loading-label">
-            <span id="viewer-loading-stage">Loading model...</span>
-            <span id="viewer-loading-percent">0%</span>
-          </div>
-          <progress id="viewer-loading-bar" max="100" value="0">0%</progress>
-        </div>
+    <main class="page model-list-page">
+      <section class="hero">
+        <p class="eyebrow">Model library</p>
+        <h1>Uploaded models</h1>
+        <p class="lede">Browse the models currently stored on the server. The list shows metadata only; model files remain server-side.</p>
+      </section>
+      <section class="card">
+        <div id="model-list-status" class="list-status">Loading models...</div>
+        <div id="model-list" class="model-list" hidden></div>
       </section>
     </main>
   `;
 
-  loadModel(modelId);
+  const status = document.querySelector('#model-list-status');
+  const list = document.querySelector('#model-list');
+
+  try {
+    const payload = await loadJson(`${basePath}/api/models`);
+    const models = payload.models || [];
+    status.textContent = `${models.length} ${models.length === 1 ? 'model' : 'models'} stored`;
+    list.innerHTML = models.length
+      ? models.map(renderModelListItem).join('')
+      : '<p class="empty-state">No models have been uploaded yet.</p>';
+    list.hidden = false;
+  } catch (error) {
+    status.className = 'result error';
+    status.textContent = `Unable to load model list: ${error.message}`;
+  }
+}
+
+function renderModelListItem(model) {
+  const missingMaterials = model.missingMaterials?.length
+    ? `<span class="meta-pill warning">${model.missingMaterials.length} missing material ${model.missingMaterials.length === 1 ? 'file' : 'files'}</span>`
+    : '<span class="meta-pill">materials ok</span>';
+
+  return `
+    <article class="model-list-item">
+      <div class="model-list-main">
+        <p class="eyebrow">${escapeHtml(model.storageType)}</p>
+        <h2>${escapeHtml(model.name)}</h2>
+        <p class="model-id">${escapeHtml(model.id)}</p>
+      </div>
+      <div class="model-meta-grid">
+        <span><strong>Uploaded</strong>${formatDateTime(model.uploadedAt)}</span>
+        <span><strong>Updated</strong>${formatDateTime(model.updatedAt)}</span>
+        <span><strong>Model size</strong>${formatBytes(model.modelSizeBytes)}</span>
+        <span><strong>Total size</strong>${formatBytes(model.totalSizeBytes)}</span>
+        <span><strong>Assets</strong>${model.assetCount} files</span>
+        <span><strong>Textures</strong>${model.textureCount}</span>
+      </div>
+      <div class="model-meta-pills">
+        <span class="meta-pill">${model.materialCount} material ${model.materialCount === 1 ? 'file' : 'files'}</span>
+        ${missingMaterials}
+        <span class="meta-pill">${model.renderCached ? 'preview cached' : 'preview not cached'}</span>
+      </div>
+      <a class="viewer-link" href="${escapeAttribute(toLocalUrl(model.viewerUrl))}">Open preview</a>
+    </article>
+  `;
 }
 
 function renderPictureViewer(modelId) {
   app.innerHTML = `
     <main class="viewer-page picture-page">
-      <header class="viewer-header">
-        <a href="${basePath || '/'}">Upload another</a>
-        <div>
-          <p class="eyebrow">Picture mode</p>
-          <h1>Server-rendered model</h1>
-          <nav class="viewer-mode-links" aria-label="Viewer modes">
-            <a href="${basePath}/models/${modelId}">3D</a>
-            <a aria-current="page" href="${basePath}/models/${modelId}/picture">Picture</a>
-          </nav>
-        </div>
-      </header>
       <section class="viewer-shell picture-shell">
         <img id="rendered-picture" class="rendered-picture" alt="Server-rendered preview of the shared 3D model" hidden />
-        <div class="picture-help">Left-drag to orbit. Right-drag to pan. Scroll or pinch to zoom.</div>
         <div id="viewer-status" class="viewer-status viewer-loading picture-rendering-status" role="status" aria-live="polite">
           <div class="viewer-loading-label">
             <span id="viewer-loading-stage">Warming server renderer...</span>
@@ -296,52 +304,60 @@ function renderPictureViewer(modelId) {
     panY: 0,
   };
   const streamState = {
-    dirty: true,
-    inFlight: false,
+    socket: null,
+    nextRequestId: 0,
+    latestRequestId: 0,
+    requestStartedAt: new Map(),
+    pendingFrameMetadata: null,
+    loadingFrameMetadata: null,
+    currentObjectUrl: null,
+    nextObjectUrl: null,
+    interactiveFrameRequest: null,
+    idleTimer: null,
     pointerId: null,
     lastX: 0,
     lastY: 0,
     dragMode: 'orbit',
-    resolutionIndex: 0,
-    requestStartedAt: null,
     lastDelayMs: null,
-    cameraChangedInFlight: false,
     hasDisplayedImage: false,
   };
 
   image.addEventListener('load', () => {
-    const wasWaitingForFirstImage = !streamState.hasDisplayedImage;
-    if (streamState.requestStartedAt !== null) {
-      streamState.lastDelayMs = performance.now() - streamState.requestStartedAt;
-      streamState.requestStartedAt = null;
-      if (streamState.cameraChangedInFlight) {
-        streamState.resolutionIndex = 0;
-        streamState.lastDelayMs = null;
-      } else if (wasWaitingForFirstImage && streamState.resolutionIndex < pictureResolutionLevels.length - 1) {
-        streamState.resolutionIndex += 1;
-        streamState.lastDelayMs = null;
-        streamState.dirty = true;
-      } else if (adaptPictureResolution(streamState)) {
-        streamState.dirty = true;
-      }
+    const metadata = streamState.loadingFrameMetadata;
+    if (metadata) {
+      const startedAt = streamState.requestStartedAt.get(metadata.requestId);
+      streamState.lastDelayMs = startedAt ? performance.now() - startedAt : metadata.renderMs;
+      streamState.requestStartedAt.delete(metadata.requestId);
+      streamState.loadingFrameMetadata = null;
     }
 
-    if (!streamState.cameraChangedInFlight || streamState.hasDisplayedImage) {
-      image.hidden = false;
-      streamState.hasDisplayedImage = true;
-      shell.classList.add('is-ready');
+    if (streamState.currentObjectUrl) {
+      URL.revokeObjectURL(streamState.currentObjectUrl);
     }
-    streamState.cameraChangedInFlight = false;
+    streamState.currentObjectUrl = streamState.nextObjectUrl;
+    streamState.nextObjectUrl = null;
+    image.hidden = false;
+    streamState.hasDisplayedImage = true;
+    shell.classList.add('is-ready');
     status.hidden = true;
-    streamState.inFlight = false;
-    requestLatestPicture(modelId, image, status, cameraState, streamState);
   });
   image.addEventListener('error', () => {
     status.className = 'viewer-status error';
     status.textContent = 'Unable to load the server-rendered picture.';
-    streamState.inFlight = false;
   });
-  requestLatestPicture(modelId, image, status, cameraState, streamState);
+  window.addEventListener('beforeunload', () => {
+    streamState.socket?.close();
+    if (streamState.currentObjectUrl) {
+      URL.revokeObjectURL(streamState.currentObjectUrl);
+    }
+    if (streamState.nextObjectUrl) {
+      URL.revokeObjectURL(streamState.nextObjectUrl);
+    }
+  }, { once: true });
+  window.addEventListener('resize', () => {
+    schedulePictureStillFrame(image, status, cameraState, streamState);
+  });
+  openPictureStream(modelId, image, status, cameraState, streamState);
 
   shell.addEventListener('pointerdown', (event) => {
     event.preventDefault();
@@ -377,12 +393,14 @@ function renderPictureViewer(modelId) {
     if (streamState.pointerId === event.pointerId) {
       streamState.pointerId = null;
       shell.classList.remove('dragging');
+      schedulePictureStillFrame(image, status, cameraState, streamState);
     }
   });
 
   shell.addEventListener('pointercancel', () => {
     streamState.pointerId = null;
     shell.classList.remove('dragging');
+    schedulePictureStillFrame(image, status, cameraState, streamState);
   });
 
   shell.addEventListener('wheel', (event) => {
@@ -590,65 +608,169 @@ function updateViewerProgress({ loadingBar, loadingStage, loadingPercent }, valu
   loadingPercent.textContent = `${percent}%`;
 }
 
-function markPictureDirty(modelId, image, status, cameraState, streamState) {
-  streamState.dirty = true;
-  if (streamState.inFlight) {
-    streamState.cameraChangedInFlight = true;
-  } else {
-    streamState.resolutionIndex = 0;
-    streamState.lastDelayMs = null;
-  }
+function openPictureStream(modelId, image, status, cameraState, streamState) {
+  const socket = new WebSocket(getPictureStreamUrl(modelId));
+  socket.binaryType = 'blob';
+  streamState.socket = socket;
+  showPictureStatus(status, 'Connecting renderer...', 'Stream');
 
-  requestLatestPicture(modelId, image, status, cameraState, streamState);
+  socket.addEventListener('open', () => {
+    sendPictureStreamRequest(image, status, cameraState, streamState, 'warmup');
+    schedulePictureStillFrame(image, status, cameraState, streamState);
+  });
+
+  socket.addEventListener('message', (event) => {
+    if (typeof event.data === 'string') {
+      handlePictureStreamMetadata(event.data, status, streamState);
+      return;
+    }
+
+    handlePictureStreamFrame(event.data, image, streamState);
+  });
+
+  socket.addEventListener('close', () => {
+    if (!streamState.hasDisplayedImage) {
+      status.hidden = false;
+      status.className = 'viewer-status error';
+      status.textContent = 'The server render stream closed before a preview was ready.';
+    }
+  });
+
+  socket.addEventListener('error', () => {
+    status.hidden = false;
+    status.className = 'viewer-status error';
+    status.textContent = 'Unable to connect to the server render stream.';
+  });
 }
 
-function requestLatestPicture(modelId, image, status, cameraState, streamState) {
-  if (!streamState.dirty || streamState.inFlight) {
+function markPictureDirty(_modelId, image, status, cameraState, streamState) {
+  clearTimeout(streamState.idleTimer);
+  if (streamState.interactiveFrameRequest) {
     return;
   }
 
-  streamState.dirty = false;
-  streamState.inFlight = true;
-  const resolution = pictureResolutionLevels[streamState.resolutionIndex];
-  streamState.requestStartedAt = performance.now();
+  streamState.interactiveFrameRequest = requestAnimationFrame(() => {
+    streamState.interactiveFrameRequest = null;
+    sendPictureStreamRequest(image, status, cameraState, streamState, 'interactive');
+    schedulePictureStillFrame(image, status, cameraState, streamState);
+  });
+}
+
+function schedulePictureStillFrame(image, status, cameraState, streamState) {
+  clearTimeout(streamState.idleTimer);
+  streamState.idleTimer = setTimeout(() => {
+    sendPictureStreamRequest(image, status, cameraState, streamState, 'still');
+  }, pictureStillDelayMs);
+}
+
+function sendPictureStreamRequest(_image, status, cameraState, streamState, mode) {
+  if (streamState.socket?.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  const frame = getPictureFrameSettings(mode);
+  const requestId = streamState.nextRequestId + 1;
+  streamState.nextRequestId = requestId;
+  streamState.latestRequestId = requestId;
+  streamState.requestStartedAt.set(requestId, performance.now());
+  showPictureStatus(
+    status,
+    mode === 'still' ? `Rendering detailed view at ${frame.width}x${frame.height}...` : `Rendering latest view at ${frame.width}x${frame.height}...`,
+    streamState.lastDelayMs === null ? 'JPEG' : `${Math.round(streamState.lastDelayMs)}ms`,
+  );
+
+  streamState.socket.send(JSON.stringify({
+    type: 'camera',
+    requestId,
+    mode,
+    yaw: Number(cameraState.yaw.toFixed(4)),
+    pitch: Number(cameraState.pitch.toFixed(4)),
+    zoom: Number(cameraState.zoom.toFixed(4)),
+    fov: cameraState.fov,
+    panX: Number(cameraState.panX.toFixed(4)),
+    panY: Number(cameraState.panY.toFixed(4)),
+    width: frame.width,
+    height: frame.height,
+    quality: frame.quality,
+  }));
+}
+
+function handlePictureStreamMetadata(message, status, streamState) {
+  const metadata = JSON.parse(message);
+  if (metadata.type === 'ready') {
+    showPictureStatus(status, 'Warming server renderer...', 'Stream');
+    return;
+  }
+
+  if (metadata.type === 'error') {
+    status.hidden = false;
+    status.className = 'viewer-status error';
+    status.textContent = metadata.error || 'Server render stream failed.';
+    return;
+  }
+
+  if (metadata.type === 'frame') {
+    streamState.pendingFrameMetadata = metadata;
+  }
+}
+
+function handlePictureStreamFrame(blob, image, streamState) {
+  const metadata = streamState.pendingFrameMetadata;
+  streamState.pendingFrameMetadata = null;
+  if (!metadata) {
+    return;
+  }
+
+  streamState.loadingFrameMetadata = metadata;
+  if (streamState.nextObjectUrl) {
+    URL.revokeObjectURL(streamState.nextObjectUrl);
+  }
+  streamState.nextObjectUrl = URL.createObjectURL(blob);
+  image.src = streamState.nextObjectUrl;
+}
+
+function getPictureFrameSettings(mode) {
+  const preset = mode === 'still'
+    ? pictureStillFrame
+    : mode === 'warmup'
+      ? pictureWarmupFrame
+      : pictureInteractiveFrame;
+  const { width, height } = getViewportMatchedFrameSize(preset);
+  return { ...preset, width, height };
+}
+
+function getViewportMatchedFrameSize({ maxSide, maxWidth, maxHeight }) {
+  const viewportWidth = Math.max(1, Math.round(window.visualViewport?.width || window.innerWidth || document.documentElement.clientWidth || 1));
+  const viewportHeight = Math.max(1, Math.round(window.visualViewport?.height || window.innerHeight || document.documentElement.clientHeight || 1));
+  const aspect = viewportWidth / viewportHeight;
+  let width;
+  let height;
+
+  if (aspect >= 1) {
+    width = maxSide;
+    height = Math.round(maxSide / aspect);
+  } else {
+    height = maxSide;
+    width = Math.round(maxSide * aspect);
+  }
+
+  const scale = Math.min(maxWidth / width, maxHeight / height, 1);
+  return {
+    width: Math.max(64, Math.round(width * scale)),
+    height: Math.max(64, Math.round(height * scale)),
+  };
+}
+
+function showPictureStatus(status, label, detail) {
   status.hidden = false;
   status.className = 'viewer-status viewer-loading picture-rendering-status';
   status.innerHTML = `
     <div class="viewer-loading-label">
-      <span>Rendering latest view at ${resolution.width}x${resolution.height}...</span>
-      <span>${streamState.lastDelayMs === null ? 'Live' : `${Math.round(streamState.lastDelayMs)}ms`}</span>
+      <span>${label}</span>
+      <span>${detail}</span>
     </div>
     <progress>Rendering</progress>
   `;
-
-  const params = new URLSearchParams({
-    yaw: cameraState.yaw.toFixed(4),
-    pitch: cameraState.pitch.toFixed(4),
-    zoom: cameraState.zoom.toFixed(4),
-    fov: String(cameraState.fov),
-    panX: cameraState.panX.toFixed(4),
-    panY: cameraState.panY.toFixed(4),
-    width: String(resolution.width),
-    height: String(resolution.height),
-    t: String(Date.now()),
-  });
-  image.src = `${basePath}/api/models/${modelId}/render.png?${params}`;
-}
-
-function adaptPictureResolution(streamState) {
-  if (streamState.lastDelayMs === null) {
-    return false;
-  }
-
-  const maxIndex = pictureResolutionLevels.length - 1;
-  if (streamState.lastDelayMs < pictureTargetDelayMs * 0.85 && streamState.resolutionIndex < maxIndex) {
-    streamState.resolutionIndex += 1;
-    return true;
-  } else if (streamState.lastDelayMs > pictureTargetDelayMs * 1.3 && streamState.resolutionIndex > 0) {
-    streamState.resolutionIndex -= 1;
-  }
-
-  return false;
 }
 
 function clamp(value, min, max) {
@@ -699,6 +821,11 @@ function frameObject(object, camera, controls) {
 function getBasePath() {
   const configured = import.meta.env.BASE_URL.replace(/\/+$/g, '');
   return configured === '/' ? '' : configured;
+}
+
+function getPictureStreamUrl(modelId) {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}${basePath}/api/models/${modelId}/render-stream`;
 }
 
 function getRoute() {
@@ -784,6 +911,10 @@ function parseJsonResponse(responseText) {
 }
 
 function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) {
+    return 'Unknown';
+  }
+
   if (bytes < 1024) {
     return `${bytes} B`;
   }
@@ -798,6 +929,25 @@ function formatBytes(bytes) {
   }
 
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatDateTime(value) {
+  if (!value) {
+    return 'Unknown';
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return 'Unknown';
+  }
+
+  return date.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 }
 
 function escapeAttribute(value) {

@@ -68,7 +68,7 @@ code {
 
 .page {
   display: grid;
-  align-content: center;
+  align-content: start;
   gap: 1rem;
 }
 
@@ -112,6 +112,10 @@ h1 {
   color: #cbd5e1;
   font-size: clamp(1rem, 3vw, 1.2rem);
   line-height: 1.65;
+}
+
+.secondary-link {
+  margin-top: 0.75rem;
 }
 
 .upload-form {
@@ -280,6 +284,89 @@ h1 {
   font-weight: 800;
 }
 
+.list-status {
+  color: #cbd5e1;
+  font-weight: 800;
+}
+
+.model-list {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.model-list[hidden] {
+  display: none;
+}
+
+.model-list-item {
+  display: grid;
+  gap: 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 22px;
+  padding: 1rem;
+  background: rgba(2, 6, 23, 0.28);
+}
+
+.model-list-main h2 {
+  margin: 0;
+  font-size: clamp(1.25rem, 4vw, 2rem);
+  overflow-wrap: anywhere;
+}
+
+.model-id {
+  margin: 0.35rem 0 0;
+  color: #94a3b8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.model-meta-grid {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.model-meta-grid span {
+  display: grid;
+  gap: 0.15rem;
+  color: #e2e8f0;
+}
+
+.model-meta-grid strong {
+  color: #94a3b8;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.model-meta-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.meta-pill {
+  border: 1px solid rgba(147, 197, 253, 0.25);
+  border-radius: 999px;
+  padding: 0.35rem 0.65rem;
+  color: #bfdbfe;
+  background: rgba(59, 130, 246, 0.1);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.meta-pill.warning {
+  border-color: rgba(251, 191, 36, 0.35);
+  color: #fde68a;
+  background: rgba(245, 158, 11, 0.12);
+}
+
+.empty-state {
+  margin: 0;
+  color: #cbd5e1;
+}
+
 .viewer-mode-links {
   display: flex;
   flex-wrap: wrap;
@@ -341,26 +428,8 @@ h1 {
   pointer-events: none;
 }
 
-.rendered-picture[hidden],
-.picture-shell:not(.is-ready) .picture-help {
+.rendered-picture[hidden] {
   display: none;
-}
-
-.picture-help {
-  position: fixed;
-  z-index: 10;
-  left: 50%;
-  bottom: 1rem;
-  max-width: min(560px, calc(100vw - 2rem));
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 999px;
-  padding: 0.65rem 0.9rem;
-  color: #cbd5e1;
-  background: rgba(15, 23, 42, 0.72);
-  font-size: 0.9rem;
-  font-weight: 800;
-  text-align: center;
-  transform: translateX(-50%);
 }
 
 .viewer-status.picture-rendering-status {
@@ -509,6 +578,10 @@ h1 {
 
   .share-row {
     grid-template-columns: 1fr auto;
+  }
+
+  .model-meta-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .viewer-header {
