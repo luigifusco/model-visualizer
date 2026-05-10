@@ -34,6 +34,7 @@ const renderChromiumMode = process.env.RENDER_CHROMIUM_MODE || 'gpu';
 const isProduction = process.env.NODE_ENV === 'production';
 const renderJobs = new Map();
 const renderSessions = new Map();
+const videoStreams = new Map();
 const renderStreamServer = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 });
 const allowedUploadExtensions = new Set([
   '.obj',
@@ -253,6 +254,32 @@ api.get('/models/:id/render.png', async (req, res, next) => {
   }
 });
 
+api.get('/models/:id/video.mjpg', async (req, res, next) => {
+  const id = req.params.id;
+  const streamId = String(req.query.streamId || '');
+  if (!isValidModelId(id) || !isValidStreamId(streamId)) {
+    res.status(400).json({ error: 'Invalid video stream request.' });
+    return;
+  }
+
+  const modelPath = getModelFilePath(id);
+  if (!modelPath) {
+    res.status(404).json({ error: 'Model not found.' });
+    return;
+  }
+
+  try {
+    await handleVideoRenderStream(req, res, id, modelPath, streamId);
+  } catch (error) {
+    if (res.headersSent) {
+      res.destroy(error);
+      return;
+    }
+
+    next(error);
+  }
+});
+
 api.get('/models/:id/assets/:filename', requireInternalRenderRequest, (req, res) => {
   const id = req.params.id;
   const filename = req.params.filename;
@@ -361,7 +388,12 @@ server.on('upgrade', (req, socket, head) => {
   });
 });
 
-renderStreamServer.on('connection', (ws, _req, { id, modelPath }) => {
+renderStreamServer.on('connection', (ws, _req, { id, modelPath, streamId }) => {
+  if (streamId) {
+    handleVideoControlStream(ws, id, modelPath, streamId);
+    return;
+  }
+
   handleRenderStream(ws, id, modelPath);
 });
 
@@ -389,6 +421,10 @@ function isUploadRequest(req) {
 
 function isValidModelId(id) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+}
+
+function isValidStreamId(id) {
+  return /^[A-Za-z0-9_-]{8,80}$/.test(id);
 }
 
 function requireInternalRenderRequest(req, res, next) {
@@ -422,7 +458,12 @@ function getRenderStreamRequest(req) {
     return { ok: false, status: 404, message: 'Model not found.' };
   }
 
-  return { ok: true, id, modelPath };
+  const streamId = url.searchParams.get('streamId') || null;
+  if (streamId !== null && !isValidStreamId(streamId)) {
+    return { ok: false, status: 400, message: 'Invalid stream id.' };
+  }
+
+  return { ok: true, id, modelPath, streamId };
 }
 
 function getModelFilePath(id) {
@@ -509,6 +550,133 @@ function getLegacyModelMetadata(id, modelPath) {
     renderCached: fs.existsSync(renderPath),
     renderUpdatedAt: fs.existsSync(renderPath) ? fs.statSync(renderPath).mtime.toISOString() : null,
   };
+}
+
+async function handleVideoRenderStream(req, res, id, modelPath, streamId) {
+  const state = getVideoStreamState(id, modelPath, streamId);
+  const boundary = 'model-visualizer-frame';
+  let closed = false;
+  let lastVersion = 0;
+
+  state.httpClients += 1;
+  state.lastAccess = Date.now();
+  req.on('close', () => {
+    closed = true;
+    wakeVideoStreamState(state);
+  });
+
+  res.writeHead(200, {
+    'Content-Type': `multipart/x-mixed-replace; boundary=${boundary}`,
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    Connection: 'keep-alive',
+    Pragma: 'no-cache',
+    Expires: '0',
+    'X-Accel-Buffering': 'no',
+  });
+
+  try {
+    while (!closed && !res.destroyed) {
+      await waitForVideoStreamState(state, lastVersion);
+      if (closed || res.destroyed || state.version === lastVersion || !state.latestState) {
+        continue;
+      }
+
+      const cameraState = state.latestState;
+      lastVersion = state.version;
+      const startedAt = Date.now();
+      const buffer = await renderModelImageBuffer(id, modelPath, cameraState);
+      if (closed || res.destroyed) {
+        break;
+      }
+
+      res.write(
+        `--${boundary}\r\n`
+        + 'Content-Type: image/jpeg\r\n'
+        + `Content-Length: ${buffer.length}\r\n`
+        + `X-Request-ID: ${cameraState.requestId}\r\n`
+        + `X-Render-Mode: ${cameraState.mode}\r\n`
+        + `X-Render-Ms: ${Date.now() - startedAt}\r\n\r\n`,
+      );
+      if (!res.write(buffer)) {
+        await new Promise((resolve) => res.once('drain', resolve));
+      }
+      res.write('\r\n');
+    }
+  } finally {
+    state.httpClients -= 1;
+    cleanupVideoStreamState(state);
+  }
+}
+
+function getVideoStreamState(id, modelPath, streamId) {
+  const key = `${id}:${streamId}`;
+  const existing = videoStreams.get(key);
+  if (existing) {
+    existing.lastAccess = Date.now();
+    return existing;
+  }
+
+  const state = {
+    key,
+    id,
+    modelPath,
+    streamId,
+    latestState: null,
+    version: 0,
+    waiters: new Set(),
+    httpClients: 0,
+    wsClients: 0,
+    lastAccess: Date.now(),
+  };
+  videoStreams.set(key, state);
+  return state;
+}
+
+function updateVideoStreamState(state, cameraState) {
+  state.latestState = cameraState;
+  state.version += 1;
+  state.lastAccess = Date.now();
+  wakeVideoStreamState(state);
+}
+
+function wakeVideoStreamState(state) {
+  for (const resolve of state.waiters) {
+    resolve();
+  }
+  state.waiters.clear();
+}
+
+function waitForVideoStreamState(state, lastVersion) {
+  if (state.version !== lastVersion) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      state.waiters.delete(done);
+      resolve();
+    }, 30 * 1000);
+    timeout.unref?.();
+    const done = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
+    state.waiters.add(done);
+  });
+}
+
+function cleanupVideoStreamState(state) {
+  state.lastAccess = Date.now();
+  if (state.httpClients > 0 || state.wsClients > 0) {
+    return;
+  }
+
+  setTimeout(() => {
+    if (state.httpClients === 0 && state.wsClients === 0 && Date.now() - state.lastAccess >= 30 * 1000) {
+      videoStreams.delete(state.key);
+      wakeVideoStreamState(state);
+    }
+  }, 30 * 1000).unref?.();
 }
 
 function writeModelMetadata(modelDir, metadata) {
@@ -664,6 +832,43 @@ function handleRenderStream(ws, id, modelPath) {
       }
     }
   }
+}
+
+function handleVideoControlStream(ws, id, modelPath, streamId) {
+  const state = getVideoStreamState(id, modelPath, streamId);
+  state.wsClients += 1;
+  state.lastAccess = Date.now();
+
+  ws.send(JSON.stringify({
+    type: 'ready',
+    id,
+    streamId,
+    maxWidth: renderWidth,
+    maxHeight: renderHeight,
+    mimeType: 'multipart/x-mixed-replace',
+  }));
+
+  ws.on('message', (data) => {
+    try {
+      const cameraState = parseRenderStreamMessage(data);
+      updateVideoStreamState(state, cameraState);
+      ws.send(JSON.stringify({
+        type: 'accepted',
+        requestId: cameraState.requestId,
+        mode: cameraState.mode,
+        width: cameraState.width,
+        height: cameraState.height,
+        quality: cameraState.quality,
+      }));
+    } catch (error) {
+      sendRenderStreamError(ws, error);
+    }
+  });
+
+  ws.on('close', () => {
+    state.wsClients -= 1;
+    cleanupVideoStreamState(state);
+  });
 }
 
 function sendRenderStreamError(ws, error) {

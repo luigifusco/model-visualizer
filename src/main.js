@@ -304,14 +304,11 @@ function renderPictureViewer(modelId) {
     panY: 0,
   };
   const streamState = {
+    streamId: crypto.randomUUID(),
     socket: null,
     nextRequestId: 0,
     latestRequestId: 0,
     requestStartedAt: new Map(),
-    pendingFrameMetadata: null,
-    loadingFrameMetadata: null,
-    currentObjectUrl: null,
-    nextObjectUrl: null,
     interactiveFrameRequest: null,
     idleTimer: null,
     pointerId: null,
@@ -323,19 +320,6 @@ function renderPictureViewer(modelId) {
   };
 
   image.addEventListener('load', () => {
-    const metadata = streamState.loadingFrameMetadata;
-    if (metadata) {
-      const startedAt = streamState.requestStartedAt.get(metadata.requestId);
-      streamState.lastDelayMs = startedAt ? performance.now() - startedAt : metadata.renderMs;
-      streamState.requestStartedAt.delete(metadata.requestId);
-      streamState.loadingFrameMetadata = null;
-    }
-
-    if (streamState.currentObjectUrl) {
-      URL.revokeObjectURL(streamState.currentObjectUrl);
-    }
-    streamState.currentObjectUrl = streamState.nextObjectUrl;
-    streamState.nextObjectUrl = null;
     image.hidden = false;
     streamState.hasDisplayedImage = true;
     shell.classList.add('is-ready');
@@ -347,12 +331,6 @@ function renderPictureViewer(modelId) {
   });
   window.addEventListener('beforeunload', () => {
     streamState.socket?.close();
-    if (streamState.currentObjectUrl) {
-      URL.revokeObjectURL(streamState.currentObjectUrl);
-    }
-    if (streamState.nextObjectUrl) {
-      URL.revokeObjectURL(streamState.nextObjectUrl);
-    }
   }, { once: true });
   window.addEventListener('resize', () => {
     schedulePictureStillFrame(image, status, cameraState, streamState);
@@ -609,10 +587,10 @@ function updateViewerProgress({ loadingBar, loadingStage, loadingPercent }, valu
 }
 
 function openPictureStream(modelId, image, status, cameraState, streamState) {
-  const socket = new WebSocket(getPictureStreamUrl(modelId));
-  socket.binaryType = 'blob';
+  const socket = new WebSocket(getPictureStreamUrl(modelId, streamState.streamId));
   streamState.socket = socket;
-  showPictureStatus(status, 'Connecting renderer...', 'Stream');
+  showPictureStatus(status, 'Connecting video stream...', 'MJPEG');
+  image.src = getPictureVideoUrl(modelId, streamState.streamId);
 
   socket.addEventListener('open', () => {
     sendPictureStreamRequest(image, status, cameraState, streamState, 'warmup');
@@ -620,26 +598,21 @@ function openPictureStream(modelId, image, status, cameraState, streamState) {
   });
 
   socket.addEventListener('message', (event) => {
-    if (typeof event.data === 'string') {
-      handlePictureStreamMetadata(event.data, status, streamState);
-      return;
-    }
-
-    handlePictureStreamFrame(event.data, image, streamState);
+    handlePictureStreamMetadata(event.data, status, streamState);
   });
 
   socket.addEventListener('close', () => {
     if (!streamState.hasDisplayedImage) {
       status.hidden = false;
       status.className = 'viewer-status error';
-      status.textContent = 'The server render stream closed before a preview was ready.';
+      status.textContent = 'The server video stream closed before a preview was ready.';
     }
   });
 
   socket.addEventListener('error', () => {
     status.hidden = false;
     status.className = 'viewer-status error';
-    status.textContent = 'Unable to connect to the server render stream.';
+    status.textContent = 'Unable to connect to the server video stream.';
   });
 }
 
@@ -676,7 +649,7 @@ function sendPictureStreamRequest(_image, status, cameraState, streamState, mode
   showPictureStatus(
     status,
     mode === 'still' ? `Rendering detailed view at ${frame.width}x${frame.height}...` : `Rendering latest view at ${frame.width}x${frame.height}...`,
-    streamState.lastDelayMs === null ? 'JPEG' : `${Math.round(streamState.lastDelayMs)}ms`,
+    'Video',
   );
 
   streamState.socket.send(JSON.stringify({
@@ -698,7 +671,7 @@ function sendPictureStreamRequest(_image, status, cameraState, streamState, mode
 function handlePictureStreamMetadata(message, status, streamState) {
   const metadata = JSON.parse(message);
   if (metadata.type === 'ready') {
-    showPictureStatus(status, 'Warming server renderer...', 'Stream');
+    showPictureStatus(status, 'Warming server renderer...', 'Video');
     return;
   }
 
@@ -709,24 +682,9 @@ function handlePictureStreamMetadata(message, status, streamState) {
     return;
   }
 
-  if (metadata.type === 'frame') {
-    streamState.pendingFrameMetadata = metadata;
+  if (metadata.type === 'accepted') {
+    streamState.requestStartedAt.delete(metadata.requestId);
   }
-}
-
-function handlePictureStreamFrame(blob, image, streamState) {
-  const metadata = streamState.pendingFrameMetadata;
-  streamState.pendingFrameMetadata = null;
-  if (!metadata) {
-    return;
-  }
-
-  streamState.loadingFrameMetadata = metadata;
-  if (streamState.nextObjectUrl) {
-    URL.revokeObjectURL(streamState.nextObjectUrl);
-  }
-  streamState.nextObjectUrl = URL.createObjectURL(blob);
-  image.src = streamState.nextObjectUrl;
 }
 
 function getPictureFrameSettings(mode) {
@@ -823,9 +781,13 @@ function getBasePath() {
   return configured === '/' ? '' : configured;
 }
 
-function getPictureStreamUrl(modelId) {
+function getPictureStreamUrl(modelId, streamId) {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}${basePath}/api/models/${modelId}/render-stream`;
+  return `${protocol}//${window.location.host}${basePath}/api/models/${modelId}/render-stream?streamId=${encodeURIComponent(streamId)}`;
+}
+
+function getPictureVideoUrl(modelId, streamId) {
+  return `${basePath}/api/models/${modelId}/video.mjpg?streamId=${encodeURIComponent(streamId)}`;
 }
 
 function getRoute() {
