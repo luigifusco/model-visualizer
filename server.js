@@ -28,6 +28,8 @@ const uploadTimeoutMs = Number(process.env.UPLOAD_TIMEOUT_MS || 30 * 60 * 1000);
 const tempUploadMaxAgeMs = Number(process.env.TEMP_UPLOAD_MAX_AGE_MS || 24 * 60 * 60 * 1000);
 const renderWidth = Number(process.env.RENDER_WIDTH || 1280);
 const renderHeight = Number(process.env.RENDER_HEIGHT || 900);
+const renderMaxWidth = Number(process.env.RENDER_MAX_WIDTH || Math.max(renderWidth, 4096));
+const renderMaxHeight = Number(process.env.RENDER_MAX_HEIGHT || Math.max(renderHeight, 4096));
 const renderTimeoutMs = Number(process.env.RENDER_TIMEOUT_MS || 10 * 1000);
 const renderSessionTtlMs = Number(process.env.RENDER_SESSION_TTL_MS || 60 * 1000);
 const renderChromiumMode = process.env.RENDER_CHROMIUM_MODE || 'gpu';
@@ -573,6 +575,7 @@ async function handleVideoRenderStream(req, res, id, modelPath, streamId) {
     Expires: '0',
     'X-Accel-Buffering': 'no',
   });
+  res.write(`--${boundary}\r\n`);
 
   try {
     while (!closed && !res.destroyed) {
@@ -582,30 +585,68 @@ async function handleVideoRenderStream(req, res, id, modelPath, streamId) {
       }
 
       const cameraState = state.latestState;
-      lastVersion = state.version;
+      const renderVersion = state.version;
+      lastVersion = renderVersion;
       const startedAt = Date.now();
-      const buffer = await renderModelImageBuffer(id, modelPath, cameraState);
+      state.activeRender = {
+        requestId: cameraState.requestId,
+        mode: cameraState.mode,
+        generation: cameraState.generation,
+        resolutionIndex: cameraState.resolutionIndex,
+        version: renderVersion,
+      };
+      let buffer;
+      try {
+        buffer = await renderModelImageBuffer(id, modelPath, cameraState);
+      } finally {
+        if (state.activeRender?.requestId === cameraState.requestId) {
+          state.activeRender = null;
+        }
+      }
       if (closed || res.destroyed) {
         break;
       }
 
-      res.write(
-        `--${boundary}\r\n`
-        + 'Content-Type: image/jpeg\r\n'
-        + `Content-Length: ${buffer.length}\r\n`
-        + `X-Request-ID: ${cameraState.requestId}\r\n`
-        + `X-Render-Mode: ${cameraState.mode}\r\n`
-        + `X-Render-Ms: ${Date.now() - startedAt}\r\n\r\n`,
-      );
-      if (!res.write(buffer)) {
-        await new Promise((resolve) => res.once('drain', resolve));
+      const renderMs = Date.now() - startedAt;
+      await writeMjpegFrame(res, boundary, buffer, cameraState, renderMs, false);
+      if (cameraState.terminal && !closed && !res.destroyed) {
+        await writeMjpegFrame(res, boundary, buffer, cameraState, renderMs, true);
       }
-      res.write('\r\n');
+      broadcastVideoStreamMetadata(state, {
+        type: 'rendered',
+        requestId: cameraState.requestId,
+        mode: cameraState.mode,
+        generation: cameraState.generation,
+        resolutionIndex: cameraState.resolutionIndex,
+        width: cameraState.width,
+        height: cameraState.height,
+        quality: cameraState.quality,
+        terminal: cameraState.terminal,
+        duplicated: cameraState.terminal,
+        renderMs,
+      });
     }
   } finally {
+    state.activeRender = null;
     state.httpClients -= 1;
     cleanupVideoStreamState(state);
   }
+}
+
+async function writeMjpegFrame(res, boundary, buffer, cameraState, renderMs, duplicate) {
+  res.write(
+    'Content-Type: image/jpeg\r\n'
+    + `Content-Length: ${buffer.length}\r\n`
+    + `X-Request-ID: ${cameraState.requestId}\r\n`
+    + `X-Render-Mode: ${cameraState.mode}\r\n`
+    + `X-Render-Ms: ${renderMs}\r\n`
+    + `X-Terminal-Frame: ${cameraState.terminal ? '1' : '0'}\r\n`
+    + `X-Duplicate-Frame: ${duplicate ? '1' : '0'}\r\n\r\n`,
+  );
+  if (!res.write(buffer)) {
+    await new Promise((resolve) => res.once('drain', resolve));
+  }
+  res.write(`\r\n--${boundary}\r\n`);
 }
 
 function getVideoStreamState(id, modelPath, streamId) {
@@ -622,10 +663,11 @@ function getVideoStreamState(id, modelPath, streamId) {
     modelPath,
     streamId,
     latestState: null,
+    activeRender: null,
     version: 0,
     waiters: new Set(),
     httpClients: 0,
-    wsClients: 0,
+    controlClients: new Set(),
     lastAccess: Date.now(),
   };
   videoStreams.set(key, state);
@@ -637,6 +679,15 @@ function updateVideoStreamState(state, cameraState) {
   state.version += 1;
   state.lastAccess = Date.now();
   wakeVideoStreamState(state);
+}
+
+function broadcastVideoStreamMetadata(state, metadata) {
+  const message = JSON.stringify(metadata);
+  for (const client of state.controlClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+    }
+  }
 }
 
 function wakeVideoStreamState(state) {
@@ -667,12 +718,12 @@ function waitForVideoStreamState(state, lastVersion) {
 
 function cleanupVideoStreamState(state) {
   state.lastAccess = Date.now();
-  if (state.httpClients > 0 || state.wsClients > 0) {
+  if (state.httpClients > 0 || state.controlClients.size > 0) {
     return;
   }
 
   setTimeout(() => {
-    if (state.httpClients === 0 && state.wsClients === 0 && Date.now() - state.lastAccess >= 30 * 1000) {
+    if (state.httpClients === 0 && state.controlClients.size === 0 && Date.now() - state.lastAccess >= 30 * 1000) {
       videoStreams.delete(state.key);
       wakeVideoStreamState(state);
     }
@@ -783,8 +834,8 @@ function handleRenderStream(ws, id, modelPath) {
   ws.send(JSON.stringify({
     type: 'ready',
     id,
-    maxWidth: renderWidth,
-    maxHeight: renderHeight,
+    maxWidth: renderMaxWidth,
+    maxHeight: renderMaxHeight,
     mimeType: 'image/jpeg',
   }));
 
@@ -836,15 +887,15 @@ function handleRenderStream(ws, id, modelPath) {
 
 function handleVideoControlStream(ws, id, modelPath, streamId) {
   const state = getVideoStreamState(id, modelPath, streamId);
-  state.wsClients += 1;
+  state.controlClients.add(ws);
   state.lastAccess = Date.now();
 
   ws.send(JSON.stringify({
     type: 'ready',
     id,
     streamId,
-    maxWidth: renderWidth,
-    maxHeight: renderHeight,
+    maxWidth: renderMaxWidth,
+    maxHeight: renderMaxHeight,
     mimeType: 'multipart/x-mixed-replace',
   }));
 
@@ -856,6 +907,8 @@ function handleVideoControlStream(ws, id, modelPath, streamId) {
         type: 'accepted',
         requestId: cameraState.requestId,
         mode: cameraState.mode,
+        generation: cameraState.generation,
+        resolutionIndex: cameraState.resolutionIndex,
         width: cameraState.width,
         height: cameraState.height,
         quality: cameraState.quality,
@@ -866,7 +919,7 @@ function handleVideoControlStream(ws, id, modelPath, streamId) {
   });
 
   ws.on('close', () => {
-    state.wsClients -= 1;
+    state.controlClients.delete(ws);
     cleanupVideoStreamState(state);
   });
 }
@@ -1139,8 +1192,8 @@ function parseRenderCameraQuery(query) {
     fov: parseBoundedNumber(query.fov, 10, 100, 45),
     panX: parseBoundedNumber(query.panX, -100, 100, 0),
     panY: parseBoundedNumber(query.panY, -100, 100, 0),
-    width: Math.round(parseBoundedNumber(query.width, 64, renderWidth, renderWidth)),
-    height: Math.round(parseBoundedNumber(query.height, 64, renderHeight, renderHeight)),
+    width: Math.round(parseBoundedNumber(query.width, 64, renderMaxWidth, renderWidth)),
+    height: Math.round(parseBoundedNumber(query.height, 64, renderMaxHeight, renderHeight)),
     format: parseRenderFormat(query.format, 'png'),
     quality: Math.round(parseBoundedNumber(query.quality, 30, 95, 80)),
   };
@@ -1157,15 +1210,18 @@ function parseRenderStreamMessage(data) {
 
   return {
     requestId: Number.isSafeInteger(Number(payload.requestId)) ? Number(payload.requestId) : Date.now(),
-    mode: payload.mode === 'still' ? 'still' : 'interactive',
+    mode: typeof payload.mode === 'string' && payload.mode ? payload.mode.slice(0, 32) : 'progressive',
+    generation: Number.isSafeInteger(Number(payload.generation)) ? Number(payload.generation) : 0,
+    resolutionIndex: Math.round(parseBoundedNumber(payload.resolutionIndex, 0, 20, 0)),
+    terminal: payload.terminal === true,
     yaw: parseBoundedNumber(payload.yaw, -100, 100, 0),
     pitch: parseBoundedNumber(payload.pitch, -Math.PI + 0.05, Math.PI - 0.05, 0),
     zoom: parseBoundedNumber(payload.zoom, 0.05, 20, 1),
     fov: parseBoundedNumber(payload.fov, 10, 100, 45),
     panX: parseBoundedNumber(payload.panX, -100, 100, 0),
     panY: parseBoundedNumber(payload.panY, -100, 100, 0),
-    width: Math.round(parseBoundedNumber(payload.width, 64, renderWidth, 320)),
-    height: Math.round(parseBoundedNumber(payload.height, 64, renderHeight, 225)),
+    width: Math.round(parseBoundedNumber(payload.width, 64, renderMaxWidth, 320)),
+    height: Math.round(parseBoundedNumber(payload.height, 64, renderMaxHeight, 225)),
     format: 'jpeg',
     quality: Math.round(parseBoundedNumber(payload.quality, 30, 90, 60)),
   };
@@ -1251,7 +1307,7 @@ async function startVirtualDisplay() {
   }
 
   const display = `:${100 + Math.floor(Math.random() * 900)}`;
-  const xvfbProcess = spawn(xvfbPath, [display, '-screen', '0', `${renderWidth}x${renderHeight}x24`], {
+  const xvfbProcess = spawn(xvfbPath, [display, '-screen', '0', `${renderMaxWidth}x${renderMaxHeight}x24`], {
     stdio: 'ignore',
   });
 

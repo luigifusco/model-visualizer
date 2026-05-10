@@ -6,10 +6,14 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 
-const pictureWarmupFrame = { maxSide: 180, maxWidth: 180, maxHeight: 180, quality: 45 };
-const pictureInteractiveFrame = { maxSide: 360, maxWidth: 480, maxHeight: 480, quality: 55 };
-const pictureStillFrame = { maxSide: 1280, maxWidth: 1280, maxHeight: 900, quality: 82 };
-const pictureStillDelayMs = 350;
+const pictureFrameLadder = [
+  { label: 'minimum', maxSide: 180, maxWidth: 180, maxHeight: 180, quality: 45 },
+  { label: 'low', maxSide: 300, maxWidth: 420, maxHeight: 420, quality: 55 },
+  { label: 'medium', maxSide: 480, maxWidth: 640, maxHeight: 640, quality: 62 },
+  { label: 'high', maxSide: 720, maxWidth: 960, maxHeight: 720, quality: 72 },
+  { label: 'viewport', viewport: true, quality: 82 },
+];
+const pictureProgressionMaxMs = 10_000;
 
 const app = document.querySelector('#app');
 const basePath = getBasePath();
@@ -305,90 +309,150 @@ function renderPictureViewer(modelId) {
   };
   const streamState = {
     streamId: crypto.randomUUID(),
+    cameraState,
     socket: null,
     nextRequestId: 0,
     latestRequestId: 0,
     requestStartedAt: new Map(),
-    interactiveFrameRequest: null,
-    idleTimer: null,
+    pendingRequest: null,
+    frameRequest: null,
+    cameraGeneration: 0,
+    stableStartedAt: performance.now(),
+    nextResolutionIndex: 0,
+    activePointers: new Map(),
     pointerId: null,
     lastX: 0,
     lastY: 0,
     dragMode: 'orbit',
+    pinchStartDistance: 0,
+    pinchStartZoom: cameraState.zoom,
+    pinchLastCenter: null,
     lastDelayMs: null,
     hasDisplayedImage: false,
   };
 
   image.addEventListener('load', () => {
+    logPictureEvent('image-load', {
+      src: image.currentSrc,
+      naturalWidth: image.naturalWidth,
+      naturalHeight: image.naturalHeight,
+      requestId: streamState.latestRequestId,
+    });
     image.hidden = false;
     streamState.hasDisplayedImage = true;
     shell.classList.add('is-ready');
     status.hidden = true;
   });
   image.addEventListener('error', () => {
+    logPictureEvent('image-error', {
+      src: image.currentSrc,
+      requestId: streamState.latestRequestId,
+    });
     status.className = 'viewer-status error';
     status.textContent = 'Unable to load the server-rendered picture.';
   });
   window.addEventListener('beforeunload', () => {
+    logPictureEvent('beforeunload-close-stream', {
+      streamId: streamState.streamId,
+    });
     streamState.socket?.close();
   }, { once: true });
   window.addEventListener('resize', () => {
-    schedulePictureStillFrame(image, status, cameraState, streamState);
+    logPictureEvent('resize-reset-scheduler', {
+      viewport: getViewportDebugInfo(),
+      camera: getCameraDebugState(cameraState),
+    });
+    resetPictureProgression(modelId, image, status, cameraState, streamState, 'resize');
   });
   openPictureStream(modelId, image, status, cameraState, streamState);
 
   shell.addEventListener('pointerdown', (event) => {
     event.preventDefault();
     shell.setPointerCapture(event.pointerId);
-    streamState.pointerId = event.pointerId;
-    streamState.lastX = event.clientX;
-    streamState.lastY = event.clientY;
-    streamState.dragMode = event.button === 2 ? 'pan' : 'orbit';
+    streamState.activePointers.set(event.pointerId, getPointerPosition(event));
+    logPictureEvent('pointerdown', {
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      button: event.button,
+      activePointers: streamState.activePointers.size,
+      point: getPointerPosition(event),
+    });
+
+    if (streamState.activePointers.size >= 2) {
+      startPicturePinch(cameraState, streamState);
+    } else {
+      streamState.pointerId = event.pointerId;
+      streamState.lastX = event.clientX;
+      streamState.lastY = event.clientY;
+      streamState.dragMode = event.button === 2 ? 'pan' : 'orbit';
+    }
+
     shell.classList.add('dragging');
   });
 
   shell.addEventListener('pointermove', (event) => {
+    if (!streamState.activePointers.has(event.pointerId)) {
+      return;
+    }
+
+    event.preventDefault();
+    streamState.activePointers.set(event.pointerId, getPointerPosition(event));
+    if (streamState.activePointers.size >= 2) {
+      logPictureEvent('pointermove-pinch', {
+        pointerId: event.pointerId,
+        activePointers: streamState.activePointers.size,
+      });
+      updatePicturePinch(modelId, image, status, cameraState, streamState);
+      return;
+    }
+
     if (streamState.pointerId !== event.pointerId) {
       return;
     }
 
-    const deltaX = event.clientX - streamState.lastX;
-    const deltaY = event.clientY - streamState.lastY;
-    streamState.lastX = event.clientX;
-    streamState.lastY = event.clientY;
-    if (streamState.dragMode === 'pan') {
-      cameraState.panX -= deltaX * 0.002;
-      cameraState.panY += deltaY * 0.002;
-    } else {
-      cameraState.yaw -= deltaX * 0.01;
-      cameraState.pitch = clamp(cameraState.pitch - deltaY * 0.01, -Math.PI + 0.1, Math.PI - 0.1);
+    const moved = applyPicturePointerMovement(event, cameraState, streamState);
+    if (moved) {
+      markPictureDirty(modelId, image, status, cameraState, streamState);
     }
-
-    markPictureDirty(modelId, image, status, cameraState, streamState);
   });
 
   shell.addEventListener('pointerup', (event) => {
-    if (streamState.pointerId === event.pointerId) {
-      streamState.pointerId = null;
-      shell.classList.remove('dragging');
-      schedulePictureStillFrame(image, status, cameraState, streamState);
-    }
+    logPictureEvent('pointerup', {
+      pointerId: event.pointerId,
+      activePointers: streamState.activePointers.size,
+    });
+    finishPicturePointer(modelId, event, shell, image, status, cameraState, streamState);
   });
 
-  shell.addEventListener('pointercancel', () => {
-    streamState.pointerId = null;
-    shell.classList.remove('dragging');
-    schedulePictureStillFrame(image, status, cameraState, streamState);
+  shell.addEventListener('pointercancel', (event) => {
+    logPictureEvent('pointercancel', {
+      pointerId: event.pointerId,
+      activePointers: streamState.activePointers.size,
+    });
+    finishPicturePointer(modelId, event, shell, image, status, cameraState, streamState);
+  });
+
+  shell.addEventListener('lostpointercapture', (event) => {
+    logPictureEvent('lostpointercapture', {
+      pointerId: event.pointerId,
+      activePointers: streamState.activePointers.size,
+    });
+    finishPicturePointer(modelId, event, shell, image, status, cameraState, streamState);
   });
 
   shell.addEventListener('wheel', (event) => {
     event.preventDefault();
     cameraState.zoom = clamp(cameraState.zoom * Math.exp(event.deltaY * 0.001), 0.08, 12);
+    logPictureEvent('wheel-zoom', {
+      deltaY: event.deltaY,
+      camera: getCameraDebugState(cameraState),
+    });
     markPictureDirty(modelId, image, status, cameraState, streamState);
   }, { passive: false });
 
   shell.addEventListener('contextmenu', (event) => {
     event.preventDefault();
+    logPictureEvent('contextmenu-prevented', {});
   });
 }
 
@@ -589,19 +653,36 @@ function updateViewerProgress({ loadingBar, loadingStage, loadingPercent }, valu
 function openPictureStream(modelId, image, status, cameraState, streamState) {
   const socket = new WebSocket(getPictureStreamUrl(modelId, streamState.streamId));
   streamState.socket = socket;
+  logPictureEvent('stream-connect', {
+    modelId,
+    streamId: streamState.streamId,
+    videoUrl: getPictureVideoUrl(modelId, streamState.streamId),
+  });
   showPictureStatus(status, 'Connecting video stream...', 'MJPEG');
   image.src = getPictureVideoUrl(modelId, streamState.streamId);
 
   socket.addEventListener('open', () => {
-    sendPictureStreamRequest(image, status, cameraState, streamState, 'warmup');
-    schedulePictureStillFrame(image, status, cameraState, streamState);
+    logPictureEvent('websocket-open', {
+      streamId: streamState.streamId,
+      readyState: socket.readyState,
+    });
+    resetPictureProgression(modelId, image, status, cameraState, streamState, 'stream-open');
   });
 
   socket.addEventListener('message', (event) => {
+    logPictureEvent('websocket-message', {
+      raw: event.data,
+    });
     handlePictureStreamMetadata(event.data, status, streamState);
   });
 
-  socket.addEventListener('close', () => {
+  socket.addEventListener('close', (event) => {
+    logPictureEvent('websocket-close', {
+      code: event.code,
+      reason: event.reason,
+      wasClean: event.wasClean,
+      hasDisplayedImage: streamState.hasDisplayedImage,
+    });
     if (!streamState.hasDisplayedImage) {
       status.hidden = false;
       status.className = 'viewer-status error';
@@ -609,67 +690,313 @@ function openPictureStream(modelId, image, status, cameraState, streamState) {
     }
   });
 
-  socket.addEventListener('error', () => {
+  socket.addEventListener('error', (event) => {
+    logPictureEvent('websocket-error', {
+      eventType: event.type,
+      readyState: socket.readyState,
+    });
     status.hidden = false;
     status.className = 'viewer-status error';
     status.textContent = 'Unable to connect to the server video stream.';
   });
 }
 
-function markPictureDirty(_modelId, image, status, cameraState, streamState) {
-  clearTimeout(streamState.idleTimer);
-  if (streamState.interactiveFrameRequest) {
+function markPictureDirty(modelId, image, status, cameraState, streamState) {
+  logPictureEvent('mark-dirty', {
+    modelId,
+    pendingRequest: getPendingPictureDebugState(streamState),
+    camera: getCameraDebugState(cameraState),
+  });
+  resetPictureProgression(modelId, image, status, cameraState, streamState, 'camera-change');
+}
+
+function getPointerPosition(event) {
+  return {
+    x: event.clientX,
+    y: event.clientY,
+  };
+}
+
+function startPicturePinch(cameraState, streamState) {
+  const points = [...streamState.activePointers.values()];
+  const distance = getPointerDistance(points[0], points[1]);
+  if (distance <= 0) {
     return;
   }
 
-  streamState.interactiveFrameRequest = requestAnimationFrame(() => {
-    streamState.interactiveFrameRequest = null;
-    sendPictureStreamRequest(image, status, cameraState, streamState, 'interactive');
-    schedulePictureStillFrame(image, status, cameraState, streamState);
+  streamState.pointerId = null;
+  streamState.pinchStartDistance = distance;
+  streamState.pinchStartZoom = cameraState.zoom;
+  streamState.pinchLastCenter = getPointerCenter(points[0], points[1]);
+  logPictureEvent('pinch-start', {
+    distance,
+    center: streamState.pinchLastCenter,
+    camera: getCameraDebugState(cameraState),
   });
 }
 
-function schedulePictureStillFrame(image, status, cameraState, streamState) {
-  clearTimeout(streamState.idleTimer);
-  streamState.idleTimer = setTimeout(() => {
-    sendPictureStreamRequest(image, status, cameraState, streamState, 'still');
-  }, pictureStillDelayMs);
-}
-
-function sendPictureStreamRequest(_image, status, cameraState, streamState, mode) {
-  if (streamState.socket?.readyState !== WebSocket.OPEN) {
+function updatePicturePinch(modelId, image, status, cameraState, streamState) {
+  const points = [...streamState.activePointers.values()];
+  const distance = getPointerDistance(points[0], points[1]);
+  if (streamState.pinchStartDistance <= 0 || distance <= 0) {
+    startPicturePinch(cameraState, streamState);
     return;
   }
 
-  const frame = getPictureFrameSettings(mode);
+  const center = getPointerCenter(points[0], points[1]);
+  if (streamState.pinchLastCenter) {
+    cameraState.panX -= (center.x - streamState.pinchLastCenter.x) * 0.002;
+    cameraState.panY += (center.y - streamState.pinchLastCenter.y) * 0.002;
+  }
+  streamState.pinchLastCenter = center;
+  cameraState.zoom = clamp(streamState.pinchStartZoom * (streamState.pinchStartDistance / distance), 0.08, 12);
+  logPictureEvent('pinch-update', {
+    distance,
+    center,
+    startDistance: streamState.pinchStartDistance,
+    camera: getCameraDebugState(cameraState),
+  });
+  markPictureDirty(modelId, image, status, cameraState, streamState);
+}
+
+function finishPicturePointer(modelId, event, shell, image, status, cameraState, streamState) {
+  if (streamState.activePointers.size === 1 && streamState.pointerId === event.pointerId) {
+    const moved = applyPicturePointerMovement(event, cameraState, streamState, 'pointerup-drag');
+    if (moved) {
+      resetPictureProgression(modelId, image, status, cameraState, streamState, 'pointerup-camera-change');
+    }
+  }
+
+  const wasActive = streamState.activePointers.delete(event.pointerId);
+  if (!wasActive && streamState.pointerId !== event.pointerId && streamState.activePointers.size === 0) {
+    logPictureEvent('finish-pointer-ignored', {
+      type: event.type,
+      pointerId: event.pointerId,
+    });
+    return;
+  }
+
+  if (streamState.activePointers.size >= 2) {
+    logPictureEvent('finish-pointer-continue-pinch', {
+      type: event.type,
+      pointerId: event.pointerId,
+      activePointers: streamState.activePointers.size,
+    });
+    startPicturePinch(cameraState, streamState);
+    return;
+  }
+
+  const remainingPointer = streamState.activePointers.entries().next().value;
+  if (remainingPointer) {
+    const [pointerId, point] = remainingPointer;
+    streamState.pointerId = pointerId;
+    streamState.lastX = point.x;
+    streamState.lastY = point.y;
+    streamState.pinchStartDistance = 0;
+    streamState.pinchLastCenter = null;
+    logPictureEvent('finish-pointer-remaining-drag', {
+      type: event.type,
+      pointerId,
+      activePointers: streamState.activePointers.size,
+    });
+    return;
+  }
+
+  streamState.pointerId = null;
+  streamState.pinchStartDistance = 0;
+  streamState.pinchLastCenter = null;
+  shell.classList.remove('dragging');
+  logPictureEvent('finish-pointer-continue-progression', {
+    type: event.type,
+    pointerId: event.pointerId,
+    camera: getCameraDebugState(cameraState),
+  });
+  requestNextProgressivePictureFrame(image, status, cameraState, streamState);
+}
+
+function applyPicturePointerMovement(event, cameraState, streamState, eventName = 'pointermove-drag') {
+  const deltaX = event.clientX - streamState.lastX;
+  const deltaY = event.clientY - streamState.lastY;
+  streamState.lastX = event.clientX;
+  streamState.lastY = event.clientY;
+  if (deltaX === 0 && deltaY === 0) {
+    return false;
+  }
+
+  if (streamState.dragMode === 'pan') {
+    cameraState.panX -= deltaX * 0.002;
+    cameraState.panY += deltaY * 0.002;
+  } else {
+    cameraState.yaw -= deltaX * 0.01;
+    cameraState.pitch = clamp(cameraState.pitch - deltaY * 0.01, -Math.PI + 0.1, Math.PI - 0.1);
+  }
+
+  logPictureEvent(eventName, {
+    pointerId: event.pointerId,
+    dragMode: streamState.dragMode,
+    deltaX,
+    deltaY,
+    camera: getCameraDebugState(cameraState),
+  });
+  return true;
+}
+
+function getPointerDistance(first, second) {
+  return Math.hypot(second.x - first.x, second.y - first.y);
+}
+
+function getPointerCenter(first, second) {
+  return {
+    x: (first.x + second.x) / 2,
+    y: (first.y + second.y) / 2,
+  };
+}
+
+function resetPictureProgression(modelId, image, status, cameraState, streamState, reason) {
+  streamState.cameraGeneration += 1;
+  streamState.stableStartedAt = performance.now();
+  streamState.nextResolutionIndex = 0;
+  logPictureEvent('progression-reset', {
+    modelId,
+    reason,
+    generation: streamState.cameraGeneration,
+    pendingRequest: getPendingPictureDebugState(streamState),
+    camera: getCameraDebugState(cameraState),
+  });
+
+  if (streamState.pendingRequest?.resolutionIndex === 0) {
+    logPictureEvent('skip-request-lowest-pending', {
+      reason,
+      generation: streamState.cameraGeneration,
+      pendingRequest: getPendingPictureDebugState(streamState),
+    });
+    return;
+  }
+
+  if (streamState.pendingRequest) {
+    logPictureEvent('supersede-higher-resolution', {
+      reason,
+      generation: streamState.cameraGeneration,
+      pendingRequest: getPendingPictureDebugState(streamState),
+    });
+  }
+
+  requestProgressivePictureFrame(image, status, cameraState, streamState, 0, 'reset');
+}
+
+function requestNextProgressivePictureFrame(image, status, cameraState, streamState) {
+  if (streamState.pendingRequest) {
+    logPictureEvent('skip-request-pending', {
+      pendingRequest: getPendingPictureDebugState(streamState),
+    });
+    return;
+  }
+
+  const elapsedMs = performance.now() - streamState.stableStartedAt;
+  if (streamState.nextResolutionIndex > 0 && elapsedMs >= pictureProgressionMaxMs) {
+    logPictureEvent('progression-stop-time-limit', {
+      elapsedMs: Math.round(elapsedMs),
+      generation: streamState.cameraGeneration,
+      nextResolutionIndex: streamState.nextResolutionIndex,
+    });
+    return;
+  }
+
+  if (streamState.nextResolutionIndex >= pictureFrameLadder.length) {
+    logPictureEvent('progression-stop-max-resolution', {
+      elapsedMs: Math.round(elapsedMs),
+      generation: streamState.cameraGeneration,
+      lastResolutionIndex: pictureFrameLadder.length - 1,
+    });
+    return;
+  }
+
+  requestProgressivePictureFrame(
+    image,
+    status,
+    cameraState,
+    streamState,
+    streamState.nextResolutionIndex,
+    'progress',
+  );
+}
+
+function requestProgressivePictureFrame(image, status, cameraState, streamState, resolutionIndex, reason) {
+  if (streamState.frameRequest) {
+    cancelAnimationFrame(streamState.frameRequest);
+    streamState.frameRequest = null;
+  }
+
+  streamState.frameRequest = requestAnimationFrame(() => {
+    streamState.frameRequest = null;
+    sendPictureStreamRequest(image, status, cameraState, streamState, resolutionIndex, reason);
+  });
+}
+
+function sendPictureStreamRequest(_image, status, cameraState, streamState, resolutionIndex, reason) {
+  const effectiveCameraState = cameraState || streamState.cameraState;
+  if (streamState.socket?.readyState !== WebSocket.OPEN) {
+    logPictureEvent('skip-send-socket-not-open', {
+      reason,
+      resolutionIndex,
+      readyState: streamState.socket?.readyState,
+    });
+    return;
+  }
+
+  const frame = getPictureFrameSettings(resolutionIndex);
+  const elapsedStableMs = performance.now() - streamState.stableStartedAt;
+  const terminal = resolutionIndex >= pictureFrameLadder.length - 1
+    || (resolutionIndex > 0 && elapsedStableMs >= pictureProgressionMaxMs);
   const requestId = streamState.nextRequestId + 1;
   streamState.nextRequestId = requestId;
   streamState.latestRequestId = requestId;
-  streamState.requestStartedAt.set(requestId, performance.now());
+  const generation = streamState.cameraGeneration;
+  const startedAt = performance.now();
+  streamState.pendingRequest = {
+    requestId,
+    generation,
+    resolutionIndex,
+    startedAt,
+    reason,
+  };
+  streamState.requestStartedAt.set(requestId, startedAt);
   showPictureStatus(
     status,
-    mode === 'still' ? `Rendering detailed view at ${frame.width}x${frame.height}...` : `Rendering latest view at ${frame.width}x${frame.height}...`,
+    `Rendering ${frame.label} view at ${frame.width}x${frame.height}...`,
     'Video',
   );
 
-  streamState.socket.send(JSON.stringify({
+  const payload = {
     type: 'camera',
     requestId,
-    mode,
-    yaw: Number(cameraState.yaw.toFixed(4)),
-    pitch: Number(cameraState.pitch.toFixed(4)),
-    zoom: Number(cameraState.zoom.toFixed(4)),
-    fov: cameraState.fov,
-    panX: Number(cameraState.panX.toFixed(4)),
-    panY: Number(cameraState.panY.toFixed(4)),
+    mode: 'progressive',
+    generation,
+    resolutionIndex,
+    reason,
+    terminal,
+    yaw: Number(effectiveCameraState.yaw.toFixed(4)),
+    pitch: Number(effectiveCameraState.pitch.toFixed(4)),
+    zoom: Number(effectiveCameraState.zoom.toFixed(4)),
+    fov: effectiveCameraState.fov,
+    panX: Number(effectiveCameraState.panX.toFixed(4)),
+    panY: Number(effectiveCameraState.panY.toFixed(4)),
     width: frame.width,
     height: frame.height,
     quality: frame.quality,
-  }));
+  };
+  logPictureEvent('send-camera', {
+    ...payload,
+    frameLabel: frame.label,
+    elapsedStableMs: Math.round(elapsedStableMs),
+    viewport: getViewportDebugInfo(),
+  });
+  streamState.socket.send(JSON.stringify(payload));
 }
 
 function handlePictureStreamMetadata(message, status, streamState) {
   const metadata = JSON.parse(message);
+  logPictureEvent('stream-metadata', metadata);
   if (metadata.type === 'ready') {
     showPictureStatus(status, 'Warming server renderer...', 'Video');
     return;
@@ -683,23 +1010,71 @@ function handlePictureStreamMetadata(message, status, streamState) {
   }
 
   if (metadata.type === 'accepted') {
+    logPictureEvent('request-accepted', {
+      requestId: metadata.requestId,
+      generation: metadata.generation,
+      resolutionIndex: metadata.resolutionIndex,
+    });
+    return;
+  }
+
+  if (metadata.type === 'superseded') {
     streamState.requestStartedAt.delete(metadata.requestId);
+    if (streamState.pendingRequest?.requestId === metadata.requestId) {
+      streamState.pendingRequest = null;
+    }
+    logPictureEvent('request-superseded', metadata);
+    requestNextProgressivePictureFrame(null, status, null, streamState);
+    return;
+  }
+
+  if (metadata.type === 'rendered') {
+    const startedAt = streamState.requestStartedAt.get(metadata.requestId);
+    streamState.requestStartedAt.delete(metadata.requestId);
+    if (streamState.pendingRequest?.requestId === metadata.requestId) {
+      streamState.pendingRequest = null;
+    }
+    logPictureEvent('request-rendered', {
+      ...metadata,
+      roundTripMs: startedAt ? Math.round(performance.now() - startedAt) : null,
+      currentGeneration: streamState.cameraGeneration,
+    });
+
+    if (metadata.generation !== streamState.cameraGeneration) {
+      logPictureEvent('rendered-stale-generation', {
+        renderedGeneration: metadata.generation,
+        currentGeneration: streamState.cameraGeneration,
+      });
+      streamState.nextResolutionIndex = 0;
+      requestNextProgressivePictureFrame(null, status, null, streamState);
+      return;
+    }
+
+    streamState.nextResolutionIndex = Math.max(
+      streamState.nextResolutionIndex,
+      Number(metadata.resolutionIndex) + 1,
+    );
+    requestNextProgressivePictureFrame(null, status, null, streamState);
   }
 }
 
-function getPictureFrameSettings(mode) {
-  const preset = mode === 'still'
-    ? pictureStillFrame
-    : mode === 'warmup'
-      ? pictureWarmupFrame
-      : pictureInteractiveFrame;
+function getPictureFrameSettings(resolutionIndex) {
+  const clampedIndex = Math.min(Math.max(Number(resolutionIndex) || 0, 0), pictureFrameLadder.length - 1);
+  const preset = pictureFrameLadder[clampedIndex];
   const { width, height } = getViewportMatchedFrameSize(preset);
-  return { ...preset, width, height };
+  return { ...preset, resolutionIndex: clampedIndex, width, height };
 }
 
 function getViewportMatchedFrameSize({ maxSide, maxWidth, maxHeight }) {
   const viewportWidth = Math.max(1, Math.round(window.visualViewport?.width || window.innerWidth || document.documentElement.clientWidth || 1));
   const viewportHeight = Math.max(1, Math.round(window.visualViewport?.height || window.innerHeight || document.documentElement.clientHeight || 1));
+  if (!maxSide) {
+    return {
+      width: Math.max(64, viewportWidth),
+      height: Math.max(64, viewportHeight),
+    };
+  }
+
   const aspect = viewportWidth / viewportHeight;
   let width;
   let height;
@@ -712,7 +1087,7 @@ function getViewportMatchedFrameSize({ maxSide, maxWidth, maxHeight }) {
     width = Math.round(maxSide * aspect);
   }
 
-  const scale = Math.min(maxWidth / width, maxHeight / height, 1);
+  const scale = Math.min(maxWidth / width, maxHeight / height, viewportWidth / width, viewportHeight / height, 1);
   return {
     width: Math.max(64, Math.round(width * scale)),
     height: Math.max(64, Math.round(height * scale)),
@@ -720,6 +1095,7 @@ function getViewportMatchedFrameSize({ maxSide, maxWidth, maxHeight }) {
 }
 
 function showPictureStatus(status, label, detail) {
+  logPictureEvent('status-update', { label, detail });
   status.hidden = false;
   status.className = 'viewer-status viewer-loading picture-rendering-status';
   status.innerHTML = `
@@ -729,6 +1105,46 @@ function showPictureStatus(status, label, detail) {
     </div>
     <progress>Rendering</progress>
   `;
+}
+
+function logPictureEvent(eventName, details = {}) {
+  console.debug(`[model-visualizer:picture] ${eventName}`, {
+    at: new Date().toISOString(),
+    ...details,
+  });
+}
+
+function getCameraDebugState(cameraState) {
+  return {
+    yaw: Number(cameraState.yaw.toFixed(4)),
+    pitch: Number(cameraState.pitch.toFixed(4)),
+    zoom: Number(cameraState.zoom.toFixed(4)),
+    panX: Number(cameraState.panX.toFixed(4)),
+    panY: Number(cameraState.panY.toFixed(4)),
+    fov: cameraState.fov,
+  };
+}
+
+function getViewportDebugInfo() {
+  return {
+    width: Math.round(window.visualViewport?.width || window.innerWidth || document.documentElement.clientWidth || 0),
+    height: Math.round(window.visualViewport?.height || window.innerHeight || document.documentElement.clientHeight || 0),
+    devicePixelRatio: window.devicePixelRatio,
+  };
+}
+
+function getPendingPictureDebugState(streamState) {
+  if (!streamState.pendingRequest) {
+    return null;
+  }
+
+  return {
+    requestId: streamState.pendingRequest.requestId,
+    generation: streamState.pendingRequest.generation,
+    resolutionIndex: streamState.pendingRequest.resolutionIndex,
+    reason: streamState.pendingRequest.reason,
+    pendingMs: Math.round(performance.now() - streamState.pendingRequest.startedAt),
+  };
 }
 
 function clamp(value, min, max) {
